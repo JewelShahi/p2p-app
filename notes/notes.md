@@ -202,19 +202,242 @@ const isMatch = await bcrypt.compare(enteredPassword, hashedPasswordFromDB);
 
 `npm create vite@latest .` - allows installing react in the current pwd folder
 
-## Setup ports
+## TailwindCSS, DaisyUI and port setup
 
-In the vite config file add this 
+### Installation of TailwindCSS and DaisyUI
+
+`npm install tailwindcss @tailwindcss/vite` - installation of TailwindCSS newest version     
+`npm install daisyui@latest` - installation of DaisyUI newest version
+
+### Setup TailwindCSS and DaisyUI
+
+In the vite config file add this, for the port and for the DaisyUI, react and tailwind
 
 ```js
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: {
     port: 3000
   }
 })
 ```
+
+After this TailwindCSS and DaisyUI must be imported in the main css file (default in index.css, also heres the button behavior of the DaisyUI v4.12.24 button, not a big fan of the newer button animation)
+
+```css
+@import "tailwindcss";
+@plugin "daisyui";
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+  outline-offset: 2px;
+
+  transform: scale(1) translateZ(0);
+  transition:
+    transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.3s ease,
+    background-color 0.3s ease,
+    border-color 0.3s ease,
+    color 0.3s ease;
+
+  will-change: transform;
+}
+
+.btn:hover {
+  transform: scale(1.05) translateZ(0);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
+}
+
+.btn:focus-visible {
+  transform: scale(1.045) translateZ(0);
+}
+
+.btn:active {
+  transform: scale(0.95) translateZ(0);
+  transition: transform 0.12s cubic-bezier(0.34, 1.56, 0.64, 1);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.btn:disabled,
+.btn[disabled],
+.btn-disabled {
+  transform: scale(1) translateZ(0);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn {
+    transition: none;
+  }
+  .btn:hover,
+  .btn:active {
+    transform: none;
+  }
+}
+```
+
+## Installing Axios and setup
+
+### Installation of Axios - better API fetcher
+
+`npm install axios` - installation of axios
+
+### Set up of axios
+
+Setting Axios in a file `axios.js` in directory `src/api/`
+
+```js
+import axios from "axios";
+
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || "http://localhost:3000/api",
+  timeout: 15000,
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+// ---- Request interceptor: attach auth token ----
+api.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem("token");
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// ---- Response interceptor: unwrap data + handle errors globally ----
+api.interceptors.response.use(
+  (response) => response.data, // no more res.data.data everywhere
+  async (error) => {
+    const { response } = error;
+
+    if (!response) {
+      // network error / server down / CORS
+      console.error("Network error:", error.message);
+      return Promise.reject({ message: "Network error, please try again." });
+    }
+
+    const { status, data } = response;
+
+    switch (status) {
+      case 401:
+        // token expired/invalid — clear and redirect to login
+        localStorage.removeItem("token");
+        window.location.href = "/login";
+        break;
+      case 403:
+        console.error("Forbidden:", data?.message);
+        break;
+      case 404:
+        console.error("Not found:", data?.message);
+        break;
+      case 422:
+        console.error("Validation error:", data?.errors);
+        break;
+      case 429:
+        const retryAfter = response.headers["retry-after"];
+        console.warn(`Rate limited. Retry after ${retryAfter || "some time"}s`);
+        // optional: auto-retry once after the delay
+        break;
+      case 500:
+        console.error("Server error:", data?.message);
+        break;
+      default:
+        console.error("API error:", data?.message || error.message);
+    }
+
+    return Promise.reject(data || error);
+  }
+);
+
+export default api;
+```
+
+Usage of the setup
+
+```js
+import api from "@/api/axios";
+
+// GET
+const users = await api.get("/users");
+
+// POST
+const newUser = await api.post("/users", { name: "Alice" });
+
+// PUT / DELETE work the same way
+await api.put(`/users/${id}`, { name: "Bob" });
+await api.delete(`/users/${id}`);
+```
+
+## .env file
+
+Vite doesn't need installing of .env library. Just create .env in the root folder and use this `VITE_API_URL=http://localhost:3000/api`, the name of the variable must be exactly same for this to work.
+
+## File structure 
+
+```txt
+frontend/
+├─ src/
+│  ├─ api/                        # API communication with backend
+│  │  └─ axios.js                 
+│  ├─ assets/                     # Static files used by the app
+│  │  ├─ images/                   # Product images, logos, pictures
+│  │  ├─ icons/                    # SVG icons and icon files
+│  │  └─ fonts/                    # Custom fonts
+│  ├─ components/                 # Reusable UI components used in many pages
+│  │  ├─ AnimatedBackground.jsx               
+│  │  └─ ... 
+│  ├─ pages/                      # Full pages/screens connected to routes
+│  │  ├─ Home.jsx                
+│  │  ├─ Login.jsx                
+│  │  └─ ...  
+│  ├─ layouts/                    # Shared page structures
+│  │  ├─ Navbar.jsx            
+|  |  ├─ Footer.jsx
+│  │  └─ ...
+│  ├─ routes/                     # React Router configuration
+│  │  └─ AppRoutes.jsx
+│  ├─ hooks/                      # Custom reusable React hooks
+│  │  ├─ useAuth.js                
+│  │  └─ ...
+│  ├─ context/                    # React Context (only for simple global data)
+│  │  └─ AuthContext.jsx          
+│  ├─ store/                      # Redux global state management
+│  │  └─ store.js                   # Main Redux store configuration
+│  ├─ features/                   # Different parts of application state
+│  │  ├─ theme/
+│  │  │  └─ themeSlice.js
+│  │  ├─ auth/
+│  │  │  └─ authSlice.js
+|  |  └─ ...
+│  ├─ utils/                      # Small reusable helper functions
+│  │  ├─ formatDate.js            
+│  │  └─ ...
+│  ├─ constants/                  # Values that do not change
+│  ├─ App.jsx                     # Main application component
+│  ├─ index.css                   # Global styles
+│  └─ main.jsx                    # React entry point + Redux Provider
+├─ .env                          # Environment variables (API URLs, keys)
+├─ index.html                    # HTML template
+├─ package.json                  # Dependencies and scripts
+└─ vite.config.js                # Vite configuration
+```
+
+## Lucide React icons - better icons
+
+`npm install lucide-react` - installation of Lucide React icons
