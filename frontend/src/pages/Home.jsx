@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Share2, Magnet, Zap, Clock, ArrowRight } from 'lucide-react';
+import { Share2, Magnet, Zap, Clock, ArrowRight, Shield, Globe } from 'lucide-react';
 import toast from 'react-hot-toast';
 import socket from '../api/socket';
 import DurationSelector from '../components/DurationSelector';
+import peerdropIcon from "../assets/peerdrop-icon.png";
 
 export default function Home() {
   const navigate = useNavigate();
@@ -34,97 +35,119 @@ export default function Home() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div data-theme="dark" className="min-h-screen flex flex-col bg-base-300 relative overflow-hidden">
 
       {/* ── Header ── */}
-      <header className="w-full px-5 sm:px-8 py-5 flex items-center gap-3">
-        <div className="w-9 h-9 rounded-lg bg-primary flex items-center justify-center text-primary-content">
-          <Zap size={18} strokeWidth={2.5} />
+      <header className="relative z-10 w-full px-6 sm:px-8 py-5 flex items-center gap-3">
+        <div className="w-9 h-9 rounded-xl bg-base-100 border border-base-content/10 flex items-center justify-center">
+          <img src={peerdropIcon} alt="peerdrop-icon" width={28} />
         </div>
-        <span className="text-lg font-bold tracking-tight">PeerDrop</span>
+        <span className="text-[15px] font-semibold tracking-tight text-base-content/90">PeerDrop</span>
+        <div className="ml-auto flex items-center gap-1.5">
+          <Shield size={12} className="text-primary/50" />
+          <span className="text-[11px] text-base-content/30 font-medium tracking-wide uppercase">E2E Encrypted</span>
+        </div>
       </header>
 
       {/* ── Main content ── */}
-      <main className="flex-1 flex items-center justify-center px-4 sm:px-6 pb-12">
-        <div className="w-full max-w-4xl">
+      <main className="relative z-10 flex-1 flex items-center justify-center px-4 sm:px-6 pb-16">
+        <div className="w-full max-w-5xl">
 
           {/* Hero text */}
-          <div className="text-center mb-8 sm:mb-10">
-            <h1 className="text-2xl sm:text-3xl md:text-4xl font-extrabold tracking-tight leading-tight">
-              Share files, <span className="text-primary">peer to peer</span>
+          <div className="text-center mb-10 sm:mb-14">
+            <div className="badge badge-ghost badge-sm gap-1.5 mb-5 sm:mb-6 bg-base-100 border border-base-content/10 text-base-content/50 font-medium">
+              <Zap size={11} className="text-primary" />
+              No sign-up required
+            </div>
+
+            <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-[3.4rem] font-bold tracking-tight leading-[1.1] text-base-content">
+              Share files,{' '}
+              <span className="text-transparent bg-clip-text bg-gradient-to-r from-primary via-secondary to-accent">
+                peer to peer
+              </span>
             </h1>
-            <p className="mt-2 sm:mt-3 text-sm sm:text-base opacity-60 max-w-md mx-auto">
-              Create a room or fetch a torrent — no sign‑up, no uploads to a server.
+            <p className="mt-3 sm:mt-4 text-sm sm:text-base text-base-content/40 max-w-lg mx-auto leading-relaxed">
+              Create a room or fetch a torrent — no sign-up, no uploads to a server. Files go directly between devices.
             </p>
           </div>
 
           {/* Cards grid */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-5">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 sm:gap-6">
 
             {/* ── P2P Card ── */}
-            <div className="group card bg-base-200 shadow-lg hover:shadow-xl transition-shadow duration-300 border border-base-300/50">
-              <div className="card-body p-5 sm:p-6 gap-4">
+            <div className="card bg-base-100 border border-base-300/50 shadow-2xl aura aura-rainbow hover:-translate-y-1 transition-all duration-300">
+
+              <div className="card-body p-6 sm:p-7 gap-5">
 
                 {/* Icon + title row */}
-                <div className="flex items-start gap-3">
-                  <div className="shrink-0 w-11 h-11 rounded-xl bg-primary/10 text-primary flex items-center justify-center
-                                  group-hover:bg-primary group-hover:text-primary-content transition-colors duration-300">
-                    <Share2 size={20} />
+                <div className="flex items-start gap-4">
+                  <div className="shrink-0 w-12 h-12 rounded-2xl bg-primary/10 border border-primary/10
+                                  flex items-center justify-center text-primary
+                                  transition-all duration-500">
+                    <Share2 size={20} strokeWidth={1.8} />
                   </div>
-                  <div className="min-w-0">
-                    <h2 className="card-title text-base sm:text-lg leading-snug">Share files P2P</h2>
-                    <p className="text-xs sm:text-sm opacity-60 mt-0.5 leading-relaxed">
+                  <div className="min-w-0 pt-0.5">
+                    <h2 className="card-title text-[17px] sm:text-lg text-base-content/90">Share files P2P</h2>
+                    <p className="text-[13px] text-base-content/40 mt-1 leading-relaxed">
                       Create a session, share the link, send files directly.
                     </p>
                   </div>
                 </div>
 
+                <div className="divider my-0 before:bg-base-300 after:bg-base-300" />
+
                 {/* Duration selector */}
-                <div className="space-y-1.5">
-                  <label className="label text-xs font-medium gap-1.5 py-0">
-                    <Clock size={13} className="opacity-50" />
-                    Room stays open for
+                <div className="space-y-2.5">
+                  <label className="label text-[12px] font-medium text-base-content/40 uppercase tracking-wider gap-1.5 py-0">
+                    <Clock size={12} />
+                    Room duration
                   </label>
                   <DurationSelector value={duration} onChange={setDuration} />
                 </div>
 
                 {/* Action */}
                 <button
-                  className="btn btn-primary w-full mt-1 gap-2"
+                  className="btn btn-primary w-full mt-1 gap-2 shadow-xl aura aura-rainbow active:scale-[0.98] transition-all duration-300"
                   onClick={createSession}
                   disabled={creating}
                 >
                   {creating
                     ? <span className="loading loading-spinner loading-sm" />
                     : 'Start session'}
-                  {!creating && <ArrowRight size={16} className="ml-auto opacity-70" />}
+                  {!creating && <ArrowRight size={15} className="ml-auto opacity-60" />}
                 </button>
               </div>
             </div>
 
             {/* ── Torrent Card ── */}
-            <div className="group card bg-base-200 shadow-lg hover:shadow-xl transition-shadow duration-300 border border-base-300/50">
-              <div className="card-body p-5 sm:p-6 gap-4">
+            <div className="card bg-base-100 border border-base-300/50 shadow-2xl aura aura-rainbow hover:-translate-y-1 transition-all duration-300">
+
+              <div className="card-body p-6 sm:p-7 gap-5">
 
                 {/* Icon + title row */}
-                <div className="flex items-start gap-3">
-                  <div className="shrink-0 w-11 h-11 rounded-xl bg-secondary/10 text-secondary flex items-center justify-center
-                                  group-hover:bg-secondary group-hover:text-secondary-content transition-colors duration-300">
-                    <Magnet size={20} />
+                <div className="flex items-start gap-4">
+                  <div className="shrink-0 w-12 h-12 rounded-2xl bg-secondary/10 border border-secondary/10
+                                  flex items-center justify-center text-secondary
+                                  transition-all duration-500">
+                    <Magnet size={20} strokeWidth={1.8} />
                   </div>
-                  <div className="min-w-0">
-                    <h2 className="card-title text-base sm:text-lg leading-snug">Download a torrent</h2>
-                    <p className="text-xs sm:text-sm opacity-60 mt-0.5 leading-relaxed">
+                  <div className="min-w-0 pt-0.5">
+                    <h2 className="card-title text-[17px] sm:text-lg text-base-content/90">Download a torrent</h2>
+                    <p className="text-[13px] text-base-content/40 mt-1 leading-relaxed">
                       Paste a magnet link to fetch it through the server.
                     </p>
                   </div>
                 </div>
 
+                <div className="divider my-0 before:bg-base-300 after:bg-base-300" />
+
                 {/* Input */}
-                <div className="space-y-1.5">
-                  <label className="label text-xs font-medium py-0">Magnet link</label>
+                <div className="space-y-2.5">
+                  <label className="label text-[12px] font-medium text-base-content/40 uppercase tracking-wider py-0">
+                    Magnet link
+                  </label>
                   <textarea
-                    className="textarea textarea-bordered w-full text-sm leading-relaxed resize-none"
+                    className="textarea textarea-bordered w-full text-[13px] leading-relaxed resize-none bg-base-200 border-base-300 text-base-content/80 placeholder:text-base-content/25 focus:border-secondary focus:outline-none transition-colors duration-300"
                     rows={2}
                     placeholder="magnet:?xt=urn:btih:..."
                     value={magnet}
@@ -134,22 +157,36 @@ export default function Home() {
 
                 {/* Action */}
                 <button
-                  className="btn btn-secondary w-full mt-1 gap-2"
+                  className="btn btn-secondary w-full mt-1 gap-2 shadow-xl aura aura-rainbow active:scale-[0.98] transition-all duration-300"
                   onClick={openMagnet}
                   disabled={!magnet.trim()}
                 >
                   Fetch info
-                  <ArrowRight size={16} className="ml-auto opacity-70" />
+                  <ArrowRight size={15} className="ml-auto opacity-60" />
                 </button>
               </div>
             </div>
 
           </div>
 
-          {/* Footer hint */}
-          <p className="text-center text-xs opacity-40 mt-6 sm:mt-8">
-            All transfers are end‑to‑end encrypted. Nothing is stored.
-          </p>
+          {/* Bottom trust indicators */}
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-6 mt-8 sm:mt-12">
+            <div className="flex items-center gap-2 text-[12px] text-base-content/30">
+              <Shield size={13} className="text-primary/50" />
+              <span>End-to-end encrypted</span>
+            </div>
+            <div className="hidden sm:block w-1 h-1 rounded-full bg-base-content/10" />
+            <div className="flex items-center gap-2 text-[12px] text-base-content/30">
+              <Globe size={13} className="text-secondary/50" />
+              <span>Nothing stored on any server</span>
+            </div>
+            <div className="hidden sm:block w-1 h-1 rounded-full bg-base-content/10" />
+            <div className="flex items-center gap-2 text-[12px] text-base-content/30">
+              <Zap size={13} className="text-accent/50" />
+              <span>Instant peer connections</span>
+            </div>
+          </div>
+
         </div>
       </main>
     </div>
