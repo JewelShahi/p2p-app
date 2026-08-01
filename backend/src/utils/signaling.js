@@ -112,9 +112,20 @@ export function registerSignaling(io, roomManager) {
     // ---------- WEBRTC SIGNAL RELAY ----------
     // Pure relay: server never looks at the payload contents, just forwards it
     // to the intended peer so a direct WebRTC connection can be negotiated.
+    // ---------- WEBRTC SIGNAL RELAY ----------
     socket.on('signal', (payload) => {
       const { targetSocketId, signal } = payload || {};
       if (!targetSocketId || !signal) return;
+
+      const senderRoomId = socket.data.roomId;
+      if (!senderRoomId) return; // Sender isn't in a valid room
+
+      // Retrieve target socket and verify it exists in the same room
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+      if (!targetSocket || targetSocket.data.roomId !== senderRoomId) {
+        return; // Block cross-room signaling or unauthorized targeting
+      }
+
       io.to(targetSocketId).emit('signal', {
         fromSocketId: socket.id,
         signal,

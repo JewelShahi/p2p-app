@@ -10,11 +10,22 @@ import routes from './routes/routes.js';
 import torrentRoutes from './routes/torrent.route.js';
 import errorHandler from './middlewares/errorHandler.middleware.js';
 import { apiLimiter } from './middlewares/rateLimiter.middleware.js';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const PORT = process.env.PORT || 4000;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*'; // lock this to your real frontend origin in production
 
 const app = express();
+
+// 1. Tell Express to trust reverse proxy headers (Cloudflare, Nginx, AWS)
+// Needed so req.ip is accurate in rate limiters
+app.set('trust proxy', 1);
+
+// 2. Prevent accidental '*' wildcard CORS fallbacks in production environments
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN;
+const safeOrigin = CLIENT_ORIGIN || 'http://localhost:3000'; // Default to local dev URL only
+
 app.use(
   helmet({
     // Default CORP (same-origin) blocks file streaming/zip downloads when the
@@ -22,12 +33,12 @@ app.use(
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
-app.use(cors({ origin: CLIENT_ORIGIN }));
+app.use(cors({ origin: safeOrigin }));
 app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: CLIENT_ORIGIN, methods: ['GET', 'POST'] },
+  cors: { origin: safeOrigin, methods: ['GET', 'POST'] },
   maxHttpBufferSize: 1e6, // signaling payloads are small; file bytes never pass through this server
 });
 
