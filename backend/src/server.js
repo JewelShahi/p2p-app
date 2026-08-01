@@ -55,6 +55,10 @@ setInterval(() => roomManager.sweep(), 30_000);
 app.use('/api', apiLimiter, routes);
 app.use('/api/torrent', torrentRoutes);
 
+app.get('/', (req, res) => {
+  res.status(200).json({ message: 'Server is running' });
+});
+
 // Must be registered after all routes
 app.use(errorHandler);
 
