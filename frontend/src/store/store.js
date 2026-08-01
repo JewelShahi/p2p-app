@@ -1,8 +1,12 @@
-import { configureStore } from "@reduxjs/toolkit";
-import themeReducer from "../features/theme/themeSlice";
+import { configureStore } from '@reduxjs/toolkit';
+import themeReducer from '../features/theme/themeSlice';
+import roomReducer from '../features/room/roomSlice';
 
-export const store = configureStore({
+const store = configureStore({
   reducer: {
     theme: themeReducer,
+    room: roomReducer,
   },
 });
+
+export default store;

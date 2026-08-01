@@ -1,38 +1,52 @@
 import express from 'express';
-import dotenv from 'dotenv';
-import helmet from 'helmet';
 import cors from 'cors';
+import helmet from 'helmet';
+import http from 'http';
+import { Server } from 'socket.io';
 
-// Load environment variables early
-dotenv.config();
+import { RoomManager } from './utils/roomManager.js';
+import { registerSignaling } from './utils/signaling.js';
+import routes from './routes/routes.js';
+import torrentRoutes from './routes/torrent.route.js';
+import errorHandler from './middlewares/errorHandler.middleware.js';
+import { apiLimiter } from './middlewares/rateLimiter.middleware.js';
+
+const PORT = process.env.PORT || 4000;
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*'; // lock this to your real frontend origin in production
 
 const app = express();
+app.use(
+  helmet({
+    // Default CORP (same-origin) blocks file streaming/zip downloads when the
+    // frontend is on a different origin than this API — relax just that part.
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+);
+app.use(cors({ origin: CLIENT_ORIGIN }));
+app.use(express.json());
 
-// Set PORT from .env or default to 5000
-const PORT = process.env.PORT || 5000;
-
-// 1. Security Middlewares
-// helmet(): Sets secure HTTP headers (protects against XSS, clickjacking, hides 'X-Powered-By: Express')
-app.use(helmet());
-
-// cors(): Restricts API access to trusted domains and allows HTTP cookies/authorization headers
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
-  credentials: true
-}));
-
-// 2. Built-in Body Parsers
-app.use(express.json());                                // Parses incoming JSON payloads into req.body
-app.use(express.urlencoded({ extended: true }));       // Parses incoming URL-encoded form data into req.body
-
-// 3. Health Check / Basic Route
-app.get("/", (req, res) => {
-  res.json({ message: `Server running on port ${PORT}` });
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: CLIENT_ORIGIN, methods: ['GET', 'POST'] },
+  maxHttpBufferSize: 1e6, // signaling payloads are small; file bytes never pass through this server
 });
 
-// 4. Start Server
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+// RoomManager needs `io` to broadcast (room-closed, etc.), so it's built here
+// and shared with REST controllers via app.locals rather than each requiring its own instance.
+const roomManager = new RoomManager(io);
+app.locals.roomManager = roomManager;
 
-export default app;
+registerSignaling(io, roomManager);
+
+// Safety-net sweep in case an individual room's expiry setTimeout was ever lost
+setInterval(() => roomManager.sweep(), 30_000);
+
+app.use('/api', apiLimiter, routes);
+app.use('/api/torrent', torrentRoutes);
+
+// Must be registered after all routes
+app.use(errorHandler);
+
+server.listen(PORT, () => {
+  console.log(`P2P share backend listening on port ${PORT}`);
+});
