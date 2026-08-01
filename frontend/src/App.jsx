@@ -2,6 +2,8 @@ import { useSelector, useDispatch } from 'react-redux';
 import { toggleTheme } from './features/theme/themeSlice';
 import { Sun, Moon } from 'lucide-react';
 import AppRoutes from './routes/AppRoutes';
+import Navbar from './layouts/Navbar';
+import Footer from './layouts/Footer';
 import useOnlineStatus from './hooks/useOnlineStatus';
 
 const App = () => {
@@ -11,13 +13,9 @@ const App = () => {
 
   return (
     <div data-theme={theme} className="min-h-screen bg-base-100 text-base-content">
-      <div className="navbar bg-base-200 px-4">
-        <div className="flex-1 font-bold">P2P Share</div>
-        <button className="btn btn-ghost btn-circle" onClick={() => dispatch(toggleTheme())}>
-          {theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
-        </button>
-      </div>
+      <Navbar />
       <AppRoutes />
+      <Footer />
     </div>
   );
 };

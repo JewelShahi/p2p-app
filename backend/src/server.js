@@ -37,9 +37,19 @@ app.use(cors({ origin: safeOrigin }));
 app.use(express.json());
 
 const server = http.createServer(app);
+
 const io = new Server(server, {
-  cors: { origin: safeOrigin, methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 1e6, // signaling payloads are small; file bytes never pass through this server
+  cors: {
+    origin: (origin, callback) => {
+      if (!origin || origin.endsWith(".vercel.app") || origin === "http://localhost:3000") {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    methods: ["GET", "POST"],
+    credentials: true
+  }
 });
 
 // RoomManager needs `io` to broadcast (room-closed, etc.), so it's built here
