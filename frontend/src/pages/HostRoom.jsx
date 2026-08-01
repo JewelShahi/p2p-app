@@ -28,7 +28,13 @@ export default function HostRoom() {
       toast.success('A new device connected');
       setPeers((p) => [...p, { socketId: peerSocketId, userId: peerUserId }]);
 
-      const peer = createPeerConnection({ initiator: true, socket, targetSocketId: peerSocketId });
+      const peer = createPeerConnection({
+        initiator: true,
+        socket,
+        targetSocketId: peerSocketId,
+        onFailed: (state) => toast.error(`Connection to a peer ${state} — likely blocked by their network`),
+      });
+      
       peerConnections.current[peerSocketId] = peer;
 
       peer.on('connect', () => toast.success('Direct connection established'));
@@ -72,6 +78,14 @@ export default function HostRoom() {
           setTransfers((t) => ({ ...t, [fromSocketId]: 1 }));
         },
         onCancel: () => toast('Peer cancelled the download', { icon: '🛑' }),
+        onError: () => {
+          toast.error('Send failed — connection to that peer was not ready');
+          setTransfers((t) => {
+            const copy = { ...t };
+            delete copy[fromSocketId];
+            return copy;
+          });
+        },
       });
     });
 

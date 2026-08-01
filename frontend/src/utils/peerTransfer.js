@@ -6,9 +6,21 @@ const BACKPRESSURE_LIMIT = 4 * 1024 * 1024;
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
+  // Free public TURN for testing — openrelay.metered.ca. Swap for your own
+  // coturn server before production; free relays are rate-limited/unreliable.
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
 
-export function createPeerConnection({ initiator, socket, targetSocketId }) {
+export function createPeerConnection({ initiator, socket, targetSocketId, onFailed }) {
   const peer = new SimplePeer({
     initiator,
     trickle: true,
@@ -17,10 +29,21 @@ export function createPeerConnection({ initiator, socket, targetSocketId }) {
   peer.on('signal', (signal) => {
     socket.emit('signal', { targetSocketId, signal });
   });
+
+  // simple-peer doesn't always surface ICE failure as an 'error' event —
+  // watch the underlying RTCPeerConnection directly so a dead connection
+  // doesn't just sit silently at 0% forever.
+  peer._pc?.addEventListener?.('iceconnectionstatechange', () => {
+    const state = peer._pc.iceConnectionState;
+    if (state === 'failed' || state === 'disconnected') {
+      onFailed?.(state);
+    }
+  });
+
   return peer;
 }
 
-export function sendFiles({ peer, files, onProgress, onDone, onCancel }) {
+export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }) {
   const totalSize = files.reduce((s, f) => s + f.size, 0);
   let sentTotal = 0;
   let cancelled = false;
@@ -36,34 +59,47 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel }) {
   };
   peer.on('data', dataHandler);
 
-  (async () => {
-    for (const f of files) {
-      if (cancelled) break;
-      peer.send(JSON.stringify({ type: 'file-start', id: f.id, name: f.name, size: f.size }));
+  const waitForConnect = () =>
+    new Promise((resolve) => {
+      if (peer.connected) return resolve();
+      peer.once('connect', resolve);
+    });
 
-      const reader = f.file.stream().getReader();
-      while (true) {
+  (async () => {
+    try {
+      await waitForConnect();
+
+      for (const f of files) {
         if (cancelled) break;
-        const { done, value } = await reader.read();
-        if (done) break;
-        for (let o = 0; o < value.byteLength; o += CHUNK_SIZE) {
+        peer.send(JSON.stringify({ type: 'file-start', id: f.id, name: f.name, size: f.size }));
+
+        const reader = f.file.stream().getReader();
+        while (true) {
           if (cancelled) break;
-          const slice = value.subarray(o, o + CHUNK_SIZE);
-          peer.send(slice);
-          sentTotal += slice.byteLength;
-          onProgress?.(Math.min(sentTotal / totalSize, 1));
-          while (peer._channel && peer._channel.bufferedAmount > BACKPRESSURE_LIMIT) {
-            await new Promise((r) => setTimeout(r, 50));
+          const { done, value } = await reader.read();
+          if (done) break;
+          for (let o = 0; o < value.byteLength; o += CHUNK_SIZE) {
+            if (cancelled) break;
+            const slice = value.subarray(o, o + CHUNK_SIZE);
+            peer.send(slice);
+            sentTotal += slice.byteLength;
+            onProgress?.(Math.min(sentTotal / totalSize, 1));
+            while (peer._channel && peer._channel.bufferedAmount > BACKPRESSURE_LIMIT) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
           }
         }
+        if (!cancelled) peer.send(JSON.stringify({ type: 'file-end', id: f.id }));
       }
-      if (!cancelled) peer.send(JSON.stringify({ type: 'file-end', id: f.id }));
+      if (!cancelled) {
+        peer.send(JSON.stringify({ type: 'transfer-complete' }));
+        onDone?.();
+      }
+    } catch (err) {
+      onError?.(err);
+    } finally {
+      peer.off('data', dataHandler);
     }
-    if (!cancelled) {
-      peer.send(JSON.stringify({ type: 'transfer-complete' }));
-      onDone?.();
-    }
-    peer.off('data', dataHandler);
   })();
 }
 

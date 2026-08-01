@@ -33,7 +33,12 @@ export default function JoinRoom() {
 
     socket.on('signal', ({ fromSocketId, signal }) => {
       if (!hostPeer.current) {
-        hostPeer.current = createPeerConnection({ initiator: false, socket, targetSocketId: fromSocketId });
+        hostPeer.current = createPeerConnection({
+          initiator: false,
+          socket,
+          targetSocketId: fromSocketId,
+          onFailed: (state) => toast.error(`Connection to host ${state} — likely blocked by your network (try a different network or a TURN server)`),
+        });
         hostPeer.current.on('connect', () => toast.success('Direct connection established'));
         hostPeer.current.on('error', () => toast.error('Connection to host failed'));
       }
@@ -86,16 +91,32 @@ export default function JoinRoom() {
     if (!accept || !hostPeer.current) return;
 
     setProgress(0);
+    const stallTimer = setTimeout(() => {
+      toast.error('Download stalled — connection may have dropped');
+      setProgress(null);
+    }, 15000);
+
     receiveFiles({
       peer: hostPeer.current,
       mode,
       fileHandles,
-      onProgress: (p) => setProgress(p),
+      onProgress: (p) => {
+        clearTimeout(stallTimer);
+        setProgress(p);
+        if (p >= 1) {
+          setTimeout(() => setProgress(null), 1000);
+        }
+      },
       onDone: () => {
+        clearTimeout(stallTimer);
         toast.success('Download complete');
         setProgress(null);
       },
-      onError: () => toast.error('Something interrupted the download'),
+      onError: () => {
+        clearTimeout(stallTimer);
+        toast.error('Something interrupted the download');
+        setProgress(null);
+      },
     });
   };
 
