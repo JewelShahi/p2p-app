@@ -1,12 +1,10 @@
-// roomManager.js
+// roomManager.js — no changes needed from previous version, included for completeness
 import { v4 as uuidv4 } from 'uuid';
 
 const MIN_DURATION = 10;
 const MAX_DURATION = 60;
 const STEP = 5;
 const DEFAULT_DURATION = 20;
-
-// 5 minutes — if host or peer is disconnected longer than this, clean up
 const DISCONNECT_GRACE_MS = 5 * 60 * 1000;
 
 const isValidDuration = (minutes) => {
@@ -70,11 +68,6 @@ class RoomManager {
     room.members.delete(socketId);
   }
 
-  /**
-   * Remove ALL member entries for a given userId (there can be stale ones
-   * from previous socket ids if the peer reconnected but we didn't clean up).
-   * Returns the list of removed socketIds.
-   */
   removeMemberByUserId(roomId, userId) {
     const room = this.getRoom(roomId);
     if (!room) return [];
@@ -95,11 +88,6 @@ class RoomManager {
     return room;
   }
 
-  /**
-   * Return only members whose socket is actually connected right now.
-   * This filters out ghost entries left from peers that reconnected under
-   * a new socket id before we cleaned up the old one.
-   */
   getLiveMembers(roomId) {
     const room = this.getRoom(roomId);
     if (!room) return [];
@@ -107,8 +95,6 @@ class RoomManager {
       .filter((m) => this.io.sockets.sockets.has(m.socketId))
       .map((m) => ({ socketId: m.socketId, userId: m.userId }));
   }
-
-  // ---------- Grace-period disconnect handling ----------
 
   scheduleHostDisconnect(roomId, graceMs = DISCONNECT_GRACE_MS) {
     const room = this.getRoom(roomId);
@@ -136,7 +122,6 @@ class RoomManager {
 
     const timer = setTimeout(() => {
       room.pendingLeaves.delete(userId);
-      // Remove by userId to catch any duplicate entries too
       this.removeMemberByUserId(roomId, userId);
       this.io.to(room.hostSocketId).emit('peer-left', {
         peerSocketId: socketId,
@@ -164,9 +149,7 @@ class RoomManager {
     if (room.hostDisconnectTimer) clearTimeout(room.hostDisconnectTimer);
     for (const { timer } of room.pendingLeaves.values()) clearTimeout(timer);
     room.pendingLeaves.clear();
-
     room.status = reason === 'expired' ? 'expired' : 'closed';
-
     this.io.to(roomId).emit('room-closed', { roomId, reason });
     setTimeout(() => this.rooms.delete(roomId), 5000);
   }

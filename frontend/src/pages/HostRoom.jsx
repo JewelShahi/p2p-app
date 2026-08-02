@@ -23,7 +23,7 @@ export default function HostRoom() {
 
   const peerConnections = useRef({});
   const peerRetryCount = useRef({});
-  const pendingSends = useRef({}); // socketId -> { files } — waiting for fresh peer to connect before sending
+  const pendingSends = useRef({});
   const filesRef = useRef([]);
   useEffect(() => { filesRef.current = files; }, [files]);
 
@@ -36,22 +36,21 @@ export default function HostRoom() {
     }
   }, [roomId]);
 
-  const hasConnectedOnce = useRef(false);
   const peersRef = useRef([]);
   useEffect(() => { peersRef.current = peers; }, [peers]);
 
-  useEffect(() => {
-    if (!socket.connected) socket.connect();
+  // Tracks whether we've completed at least one successful rejoin so we can
+  // show the "Reconnecting…" badge only on ACTUAL reconnects, not on the
+  // harmless initial rejoin that fires on mount.
+  const hasJoinedOnce = useRef(false);
 
-    // Check if a peer connection is actually usable for sending data
+  useEffect(() => {
     const isPeerReady = (peer) => {
       return peer && !peer.destroyed && peer.connected &&
              peer._channel && peer._channel.readyState === 'open';
     };
 
     const connectToPeer = (peerSocketId) => {
-      // If there's a pending send for this socketId from a previous attempt,
-      // carry it forward so the new connection picks it up when it connects.
       const existingPending = pendingSends.current[peerSocketId];
 
       const peer = createPeerConnection({
@@ -59,8 +58,7 @@ export default function HostRoom() {
         socket,
         targetSocketId: peerSocketId,
         onFailed: (failState) => {
-          console.error('[peer onFailed - HostRoom]', peerSocketId, failState);
-
+          console.error('[peer onFailed]', peerSocketId, failState);
           peerConnections.current[peerSocketId]?.destroy();
           delete peerConnections.current[peerSocketId];
           delete pendingSends.current[peerSocketId];
@@ -69,8 +67,7 @@ export default function HostRoom() {
           peerRetryCount.current[peerSocketId] = attempts;
 
           if (attempts > 3) {
-            toast.error(`Connection to a peer failed — likely blocked by their network`, { id: 'peer-fail-final' });
-            // Clear any transfer progress for this peer
+            toast.error('Connection to a device failed — likely blocked by their network', { id: 'peer-fail-final' });
             setTransfers((t) => { const c = { ...t }; delete c[peerSocketId]; return c; });
             return;
           }
@@ -90,9 +87,6 @@ export default function HostRoom() {
         toast.success('Direct connection established', { id: 'peer-connected' });
         peerRetryCount.current[peerSocketId] = 0;
 
-        // If we were waiting for this peer to connect so we could send files,
-        // now's the time. This handles the case where file-response arrived
-        // but the old peer was dead and we had to create a fresh one.
         const pending = pendingSends.current[peerSocketId];
         if (pending) {
           delete pendingSends.current[peerSocketId];
@@ -101,21 +95,20 @@ export default function HostRoom() {
       });
 
       peer.on('error', (err) => {
-        console.error('[peer error - HostRoom]', peerSocketId, err);
-        toast.error('Connection to a peer failed', { id: 'peer-error' });
+        console.error('[peer error]', peerSocketId, err);
+        toast.error('Connection to a device failed', { id: 'peer-error' });
       });
 
       peer.on('iceStateChange', (iceState) => {
-        console.log('[ICE state - HostRoom]', peerSocketId, iceState);
+        console.log('[ICE state]', peerSocketId, iceState);
       });
 
       peer.on('close', () => {
-        console.log('[peer close - HostRoom]', peerSocketId);
+        console.log('[peer close]', peerSocketId);
         delete peerConnections.current[peerSocketId];
         delete pendingSends.current[peerSocketId];
       });
 
-      // Restore pending send if there was one
       if (existingPending) {
         pendingSends.current[peerSocketId] = existingPending;
       }
@@ -123,7 +116,6 @@ export default function HostRoom() {
       return peer;
     };
 
-    // Extracted so it can be called both directly and from the connect handler
     const doSendFiles = (peer, socketId, filesToSend) => {
       toast.success('Sending files…', { id: 'sending-files' });
       sendFiles({
@@ -133,48 +125,58 @@ export default function HostRoom() {
         onDone: () => {
           toast.success('Transfer complete', { id: 'transfer-done' });
           setTransfers((t) => ({ ...t, [socketId]: 1 }));
-          // Don't destroy here — the receiver will destroy its end, which
-          // closes our side too via the peer 'close' event. This avoids a
-          // double-destroy race and ensures clean state for the next batch.
         },
         onCancel: () => {
           toast('Peer cancelled the download', { icon: '🛑', id: 'transfer-cancelled' });
           setTransfers((t) => { const c = { ...t }; delete c[socketId]; return c; });
         },
         onError: (err) => {
-          console.error('[sendFiles onError - HostRoom]', socketId, err);
+          console.error('[sendFiles onError]', socketId, err);
           toast.error('Send failed — connection dropped', { id: 'send-failed' });
           setTransfers((t) => { const c = { ...t }; delete c[socketId]; return c; });
         },
       });
     };
 
-    // ---------- Socket handlers ----------
-
-    const handleConnect = () => {
-      if (!hasConnectedOnce.current) {
-        hasConnectedOnce.current = true;
-        return;
-      }
+    // ──── REJOIN — the single function that syncs host state with server ────
+    // Called on EVERY connect event AND once on mount if already connected.
+    // The server handles duplicate rejoins gracefully (idempotent), so
+    // calling this "too many times" is harmless — calling it TOO FEW times
+    // (the old hasConnectedOnce bug) is what caused the empty-room bug.
+    const tryRejoin = () => {
       if (!hostUserId.current) return;
 
-      setIsReconnecting(true);
+      // Only show the "Reconnecting…" badge on actual reconnects, not on
+      // the first mount where we're just doing a harmless sync.
+      const isFirstJoin = !hasJoinedOnce.current;
+      if (!isFirstJoin) {
+        setIsReconnecting(true);
+      }
 
       socket.emit('rejoin-room', { roomId, userId: hostUserId.current }, (res) => {
-        setIsReconnecting(false);
+        if (!isFirstJoin) {
+          setIsReconnecting(false);
+        }
+        hasJoinedOnce.current = true;
 
         if (!res?.ok) {
+          // On the very first join, a failure means the room genuinely
+          // doesn't exist (expired, server restarted, etc). Navigate away.
+          // On a reconnect, same thing — session can't be recovered.
           toast.error('This session could not be resumed', { id: 'rejoin-fail' });
           navigate('/');
           return;
         }
-        toast.success('Back online', { id: 'rejoin-success' });
+
+        // Only toast "Back online" on actual reconnects
+        if (!isFirstJoin) {
+          toast.success('Back online', { id: 'rejoin-success' });
+        }
 
         if (Array.isArray(res.members)) {
           const newSocketIds = new Set(res.members.map((m) => m.socketId));
 
-          // Destroy connections to peers that are no longer in the room
-          // (their sockets are dead — the server already filtered them out)
+          // Destroy connections to peers no longer in the room
           for (const oldSid of Object.keys(peerConnections.current)) {
             if (!newSocketIds.has(oldSid)) {
               peerConnections.current[oldSid]?.destroy();
@@ -188,12 +190,9 @@ export default function HostRoom() {
           // The server only returns live, connected members.
           setPeers(res.members);
 
-          // Re-establish WebRTC with anyone we don't already have a live
-          // connection to (new peers, or peers whose connection died while
-          // we were disconnected).
+          // Re-establish WebRTC with anyone we don't have a live connection to
           res.members.forEach((m) => {
             if (!isPeerReady(peerConnections.current[m.socketId])) {
-              // Clean up dead connection if it exists
               if (peerConnections.current[m.socketId]) {
                 peerConnections.current[m.socketId].destroy();
                 delete peerConnections.current[m.socketId];
@@ -205,7 +204,23 @@ export default function HostRoom() {
         }
       });
     };
-    socket.on('connect', handleConnect);
+
+    // Register the connect handler BEFORE checking socket.connected, so
+    // we catch reconnects that happen between this line and the check below.
+    socket.on('connect', tryRejoin);
+
+    // If the socket is already connected (normal case: we just created the
+    // room on the home page and navigated here), the 'connect' event won't
+    // fire again. We MUST call tryRejoin manually or we'll never sync.
+    // This is harmless on first mount — the server returns an empty member
+    // list and we set peers to [] (which it already is).
+    if (socket.connected) {
+      tryRejoin();
+    } else {
+      socket.connect();
+    }
+
+    // ──── Other socket handlers ────
 
     socket.on('peer-reconnected', ({ userId, socketId }) => {
       const stalePeer = peersRef.current.find((p) => p.userId === userId);
@@ -260,24 +275,13 @@ export default function HostRoom() {
 
       const peer = peerConnections.current[fromSocketId];
 
-      // If the peer connection is dead or has no open data channel, we need
-      // to create a fresh one before we can send. This fixes the "2nd batch
-      // doesn't download" bug — the receiver destroyed its end after the
-      // 1st batch, so our data channel is closed even though our peer
-      // object still exists.
       if (!isPeerReady(peer)) {
         console.log('[file-response] peer not ready, recreating connection to', fromSocketId);
-
-        // Clean up the dead connection
         if (peer) {
           peer.destroy();
           delete peerConnections.current[fromSocketId];
           delete peerRetryCount.current[fromSocketId];
         }
-
-        // Store the files to send — the connectToPeer's 'connect' handler
-        // will pick this up and call doSendFiles once the new connection is
-        // established.
         pendingSends.current[fromSocketId] = { files: filesRef.current };
         connectToPeer(fromSocketId);
         return;
@@ -296,11 +300,11 @@ export default function HostRoom() {
     });
 
     socket.on('disconnect', () => {
-      console.log('[socket disconnect - HostRoom] connection dropped, will auto-recover…');
+      console.log('[socket disconnect] connection dropped, will auto-recover…');
     });
 
     return () => {
-      socket.off('connect', handleConnect);
+      socket.off('connect', tryRejoin);
       socket.off('peer-reconnected');
       socket.off('peer-joined');
       socket.off('signal');
@@ -344,11 +348,17 @@ export default function HostRoom() {
   };
 
   const terminateRoom = () => {
-    if (isReconnecting) {
-      toast.error('Still reconnecting — please wait', { id: 'reconnecting-terminate' });
+    // Block if we're not actually connected or still waiting for rejoin to
+    // complete — prevents the race where terminate-room arrives at the
+    // server before rejoin-room and fails because socket.data is empty.
+    if (!socket.connected || isReconnecting) {
+      toast.error(!socket.connected ? 'No connection — please wait' : 'Still reconnecting — please wait', { id: 'terminate-blocked' });
       return;
     }
-    socket.emit('terminate-room', null, (res) => {
+    socket.emit('terminate-room', {
+      roomId,
+      userId: hostUserId.current,
+    }, (res) => {
       if (!res?.ok) {
         toast.error("Couldn't end the session — please try again", { id: 'terminate-fail' });
         console.error('[terminateRoom] failed', res);
@@ -360,7 +370,7 @@ export default function HostRoom() {
   };
 
   return (
-    <div className="min-h-[calc(vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
+    <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
 
       {/* Top Bar */}
       <div className="navbar bg-base-100 rounded-2xl shadow-sm border border-base-300/50 px-4 sm:px-6 mb-6">
@@ -387,7 +397,7 @@ export default function HostRoom() {
           <button
             className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error disabled:opacity-40"
             onClick={terminateRoom}
-            disabled={isReconnecting}
+            disabled={isReconnecting || !socket.connected}
           >
             <Power size={15} />
             <span className="hidden sm:inline">End</span>
@@ -516,18 +526,20 @@ export default function HostRoom() {
               <div>
                 <h2 className="text-sm font-semibold mb-1">Ready to send?</h2>
                 <p className="text-xs text-base-content/40 leading-relaxed">
-                  {isReconnecting
-                    ? 'Reconnecting to the server…'
-                    : peers.length === 0
-                      ? 'Share the room link and wait for devices to connect.'
-                      : `${peers.length} device${peers.length > 1 ? 's are' : ' is'} waiting. ${files.length === 0 ? 'Add files to begin.' : 'Hit send to start.'}`
+                  {!socket.connected
+                    ? 'No server connection — waiting…'
+                    : isReconnecting
+                      ? 'Reconnecting to the server…'
+                      : peers.length === 0
+                        ? 'Share the room link and wait for devices to connect.'
+                        : `${peers.length} device${peers.length > 1 ? 's are' : ' is'} waiting. ${files.length === 0 ? 'Add files to begin.' : 'Hit send to start.'}`
                   }
                 </p>
               </div>
               <button
                 className="btn btn-primary w-full gap-2"
                 onClick={submitOffer}
-                disabled={!files.length || !peers.length || isReconnecting}
+                disabled={!files.length || !peers.length || isReconnecting || !socket.connected}
               >
                 <Send size={16} />
                 Send to {peers.length || '—'}

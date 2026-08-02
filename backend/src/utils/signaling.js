@@ -95,13 +95,8 @@ export function registerSignaling(io, roomManager) {
         room.hostSocketId = socket.id;
         roomManager.cancelHostDisconnect(roomId);
       } else {
-        // KEY FIX: Remove ALL old member entries for this userId before
-        // adding the new one. Without this, room.members accumulates ghost
-        // entries (old socketId + new socketId for the same user), which
-        // causes the host to see duplicate peers and try signaling to dead
-        // sockets after a reconnect.
+        // Remove ALL old entries for this userId before adding the new one
         roomManager.removeMemberByUserId(roomId, userId);
-
         room.members.set(socket.id, {
           socketId: socket.id,
           userId,
@@ -111,6 +106,14 @@ export function registerSignaling(io, roomManager) {
         roomManager.cancelPeerDisconnect(roomId, userId);
       }
 
+      // Emit peer-reconnected BEFORE the ack so peers destroy their old
+      // host connection BEFORE the host starts sending new signals.
+      socket.to(roomId).emit('peer-reconnected', {
+        userId,
+        isHost: wasHost,
+        socketId: socket.id,
+      });
+
       ack?.({
         ok: true,
         roomId,
@@ -118,15 +121,7 @@ export function registerSignaling(io, roomManager) {
         expiresAt: room.expiresAt,
         remainingSeconds: roomManager.remainingSeconds(roomId),
         currentOffer: room.currentOffer,
-        // Only return members whose sockets are ACTUALLY connected right now.
-        // This prevents the host from trying to signal to dead sockets.
         members: wasHost ? roomManager.getLiveMembers(roomId) : undefined,
-      });
-
-      socket.to(roomId).emit('peer-reconnected', {
-        userId,
-        isHost: wasHost,
-        socketId: socket.id,
       });
     });
 
@@ -201,13 +196,20 @@ export function registerSignaling(io, roomManager) {
     });
 
     // ---------- HOST TERMINATES ROOM ----------
+    // Accepts roomId + userId in the payload so it works even right after
+    // a reconnect, before rejoin-room has populated socket.data. Without
+    // this, terminate fails with "room-not-found" because socket.data.roomId
+    // is null on the fresh server-side socket.
     socket.on('terminate-room', (payload, ack) => {
-      const room = roomManager.getRoom(socket.data.roomId);
+      const roomId = payload?.roomId || socket.data.roomId;
+      const userId = payload?.userId || socket.data.userId;
+      const room = roomManager.getRoom(roomId);
+
       if (!room) {
         ack?.({ ok: false, error: 'room-not-found' });
         return;
       }
-      if (socket.data.userId !== room.hostUserId) {
+      if (!userId || userId !== room.hostUserId) {
         ack?.({ ok: false, error: 'not-host' });
         return;
       }
