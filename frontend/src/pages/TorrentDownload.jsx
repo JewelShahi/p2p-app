@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import {
   Download, FolderArchive, ArrowLeft, Hash, Shield, Server,
   File, FileText, Film, Music, Image, Archive, Disc,
-  Settings, MessageSquare, FileCode, HardDrive, FolderOpen
+  Settings, MessageSquare, FileCode, HardDrive, FolderOpen, Wifi
 } from 'lucide-react';
 import api from '../api/axios';
 import { API_URL } from '../constants/config';
@@ -31,6 +31,21 @@ export default function TorrentDownload() {
   const [info, setInfo] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+
+  // --- NEW: WebSocket State ---
+  const [wsStatus, setWsStatus] = useState('idle');
+  const [wsProgress, setWsProgress] = useState(0);
+  const wsRef = useRef(null);
+  const writableRef = useRef(null);
+  const isDownloading = wsStatus === 'connecting' || wsStatus === 'writing';
+
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+      writableRef.current?.abort();
+    };
+  }, []);
+  // ----------------------------
 
   useEffect(() => {
     if (!magnet) {
@@ -60,6 +75,91 @@ export default function TorrentDownload() {
     window.location.href = url;
     toast.success('Download starting');
   };
+
+  // --- NEW: WebSocket Stream Download Function ---
+  const downloadFileWs = async (fileIndex) => {
+    if (!window.showSaveFilePicker) {
+      toast.error('Streaming requires a modern desktop browser (Chrome/Edge). Use the standard download for mobile.', { duration: 5000, id: 'ws-err' });
+      return;
+    }
+
+    let fileHandle;
+    try {
+      const fileName = info.files.length === 1 ? info.files[0].name : `${info.name}.zip`;
+      fileHandle = await window.showSaveFilePicker({ suggestedName: fileName });
+    } catch (err) {
+      if (err.name !== 'AbortError') toast.error('Could not get save location', { id: 'ws-err' });
+      return;
+    }
+
+    setWsStatus('connecting');
+    setWsProgress(0);
+
+    const wsUrl = `${API_URL.replace(/^http/, 'ws')}/ws-download`;
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    wsRef.current = ws;
+
+    let receivedBytes = 0;
+    let totalBytes = 0;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'start', magnet, fileIndex }));
+    };
+
+    ws.onmessage = async (event) => {
+      if (typeof event.data === 'string') {
+        const msg = JSON.parse(event.data);
+        
+        if (msg.type === 'meta') {
+          totalBytes = msg.size;
+          try {
+            writableRef.current = await fileHandle.createWritable();
+            setWsStatus('writing');
+            toast.success('Stream connected! Writing to disk...', { id: 'ws-status' });
+          } catch (err) {
+            toast.error('Failed to open file for writing', { id: 'ws-err' });
+            ws.close();
+          }
+        } else if (msg.type === 'done') {
+          await writableRef.current?.close();
+          setWsStatus('done');
+          setWsProgress(1);
+          toast.success('Download complete!', { id: 'ws-status' });
+          ws.close();
+        } else if (msg.type === 'error') {
+          await writableRef.current?.abort();
+          setWsStatus('error');
+          toast.error(msg.message, { id: 'ws-err' });
+          ws.close();
+        }
+        return;
+      }
+
+      if (writableRef.current && ws.readyState === WebSocket.OPEN) {
+        await writableRef.current.write(event.data);
+        receivedBytes += event.data.byteLength;
+        if (totalBytes > 0) {
+          setWsProgress(Math.min(receivedBytes / totalBytes, 0.99));
+        }
+      }
+    };
+
+    ws.onerror = () => {
+      setWsStatus('error');
+      toast.error('WebSocket connection failed', { id: 'ws-err' });
+      writableRef.current?.abort();
+    };
+
+    ws.onclose = () => {
+      if (wsStatus !== 'done' && wsStatus !== 'error') {
+        setWsStatus('error');
+        toast.error('Connection closed unexpectedly', { id: 'ws-err' });
+      }
+      writableRef.current?.abort();
+    };
+  };
+  // -------------------------------------------
 
   if (loading) {
     return (
@@ -94,6 +194,7 @@ export default function TorrentDownload() {
   if (!info) return null;
 
   const isSingleFile = info.files.length === 1;
+  const canStream = typeof window.showSaveFilePicker === 'function';
 
   return (
     <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
@@ -107,7 +208,7 @@ export default function TorrentDownload() {
           <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
             <FolderArchive size={18} className="text-primary" />
           </div>
-          <p className="text-sm text-center font-semibold leading-tight">Torrent Download</p>
+          <p className="text-sm flex justify-center items-center font-semibold leading-tight">Torrent Download</p>
         </div>
 
       </div>
@@ -214,19 +315,38 @@ export default function TorrentDownload() {
                   <h2 className="text-sm font-semibold">Ready to download?</h2>
                 </div>
                 <p className="text-xs text-base-content/40 leading-relaxed">
-                  {isSingleFile
-                    ? `${info.files[0].name} — ${formatBytes(info.files[0].size)}. Click below to start.`
-                    : `${info.files.length} files totaling ${formatBytes(info.totalSize)}. Download everything as a zip, or hover individual files.`
+                  {wsStatus === 'done' 
+                    ? 'File successfully saved to your disk.'
+                    : isSingleFile
+                      ? `${info.files[0].name} — ${formatBytes(info.files[0].size)}. Click below to start.`
+                      : `${info.files.length} files totaling ${formatBytes(info.totalSize)}. Download everything as a zip, or hover individual files.`
                   }
                 </p>
               </div>
-              <button
-                className="btn btn-primary w-full gap-2"
-                onClick={() => downloadFile(isSingleFile ? info.files[0].index : undefined)}
-              >
-                <Download size={16} />
-                {isSingleFile ? 'Download File' : 'Download All as .zip'}
-              </button>
+
+              <div className="w-full space-y-2">
+                {/* NEW: Stream Button (Desktop only) */}
+                {canStream && (
+                  <button
+                    className={`btn btn-secondary w-full gap-2 ${isDownloading ? 'loading' : ''}`}
+                    onClick={() => downloadFileWs(isSingleFile ? info.files[0].index : undefined)}
+                    disabled={isDownloading}
+                  >
+                    <Wifi size={16} />
+                    {isDownloading ? `Streaming ${Math.round(wsProgress * 100)}%` : 'Stream (No size limit)'}
+                  </button>
+                )}
+
+                {/* Existing HTTP Button */}
+                <button
+                  className="btn btn-primary w-full gap-2"
+                  onClick={() => downloadFile(isSingleFile ? info.files[0].index : undefined)}
+                  disabled={isDownloading}
+                >
+                  <Download size={16} />
+                  {isSingleFile ? 'Download File' : 'Download All as .zip'}
+                </button>
+              </div>
             </div>
           </div>
         </div>
