@@ -6,6 +6,12 @@ const MAX_DURATION = 60;
 const STEP = 5;
 const DEFAULT_DURATION = 20;
 
+// How long to keep a room alive after the host or a peer disconnects
+// (backgrounded tab, brief network drop, phone lock, etc.) before actually
+// tearing things down. If they reconnect via 'rejoin-room' within this
+// window, nothing is lost.
+const DISCONNECT_GRACE_MS = 5 * 60 * 1000;
+
 const isValidDuration = (minutes) => {
   if (typeof minutes !== 'number') return false;
   if (minutes < MIN_DURATION || minutes > MAX_DURATION) return false;
@@ -39,6 +45,8 @@ class RoomManager {
       members: new Map(), // socketId -> { socketId, userId, joinedAt, downloading: Set<fileId> }
       currentOffer: null, // { offerId, files: [{id,name,size}], totalSize, createdAt }
       expiryTimer: null,
+      hostDisconnectTimer: null, // pending "close room" timer while host is temporarily disconnected
+      pendingLeaves: new Map(), // userId -> { timer, socketId } for peers temporarily disconnected
     };
 
     room.expiryTimer = setTimeout(() => this.closeRoom(roomId, 'expired'), expiresAt - now);
@@ -76,10 +84,69 @@ class RoomManager {
     return room;
   }
 
+  // ---------- Grace-period disconnect handling ----------
+
+  // Host's socket dropped (backgrounded tab, network blip, phone lock).
+  // Don't close the room yet — give them DISCONNECT_GRACE_MS to reconnect
+  // via 'rejoin-room'. Only actually close if that window passes.
+  scheduleHostDisconnect(roomId, graceMs = DISCONNECT_GRACE_MS) {
+    const room = this.getRoom(roomId);
+    if (!room) return;
+    if (room.hostDisconnectTimer) clearTimeout(room.hostDisconnectTimer);
+    room.hostDisconnectTimer = setTimeout(() => {
+      room.hostDisconnectTimer = null;
+      this.closeRoom(roomId, 'host-disconnected');
+    }, graceMs);
+  }
+
+  // Host reconnected in time — cancel the pending close.
+  cancelHostDisconnect(roomId) {
+    const room = this.getRoom(roomId);
+    if (!room || !room.hostDisconnectTimer) return;
+    clearTimeout(room.hostDisconnectTimer);
+    room.hostDisconnectTimer = null;
+  }
+
+  // A peer's socket dropped. Don't remove them / tell the host they left
+  // yet — give them the same grace period to reconnect.
+  schedulePeerDisconnect(roomId, socketId, userId, graceMs = DISCONNECT_GRACE_MS) {
+    const room = this.getRoom(roomId);
+    if (!room || !userId) return;
+
+    const existing = room.pendingLeaves.get(userId);
+    if (existing) clearTimeout(existing.timer);
+
+    const timer = setTimeout(() => {
+      room.pendingLeaves.delete(userId);
+      room.members.delete(socketId);
+      this.io.to(room.hostSocketId).emit('peer-left', {
+        peerSocketId: socketId,
+        peerUserId: userId,
+        disconnected: true,
+      });
+    }, graceMs);
+
+    room.pendingLeaves.set(userId, { timer, socketId });
+  }
+
+  // Peer reconnected in time — cancel the pending removal.
+  cancelPeerDisconnect(roomId, userId) {
+    const room = this.getRoom(roomId);
+    if (!room) return;
+    const pending = room.pendingLeaves.get(userId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    room.pendingLeaves.delete(userId);
+  }
+
   closeRoom(roomId, reason = 'terminated') {
     const room = this.getRoom(roomId);
     if (!room) return;
     if (room.expiryTimer) clearTimeout(room.expiryTimer);
+    if (room.hostDisconnectTimer) clearTimeout(room.hostDisconnectTimer);
+    for (const { timer } of room.pendingLeaves.values()) clearTimeout(timer);
+    room.pendingLeaves.clear();
+
     room.status = reason === 'expired' ? 'expired' : 'closed';
 
     // Notify everyone in the room (host + peers) so clients can cancel in-flight transfers

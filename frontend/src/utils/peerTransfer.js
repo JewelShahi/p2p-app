@@ -181,6 +181,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   let currentMeta = null;
   let received = 0;
   let totalExpected = 0;
+  let completed = false; // set once transfer-complete has actually been processed
   const zipParts = [];
 
   console.log('[receiveFiles] listening, peer connected:', peer.connected, 'channel exists:', !!peer._channel);
@@ -235,6 +236,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
 
         if (msg.type === 'transfer-complete') {
           console.log('[receiveFiles] transfer-complete received, total bytes:', received);
+          completed = true;
           if (mode === 'zip') {
             const JSZip = (await import('jszip')).default;
             const zip = new JSZip();
@@ -272,10 +274,11 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   attachChannelListener();
 
   peer.on('close', () => {
-    console.log('[receiveFiles] peer closed, bytes received so far:', received);
+    console.log('[receiveFiles] peer closed, bytes received so far:', received, 'completed:', completed);
     if (peer._channel) {
       peer._channel.removeEventListener('message', channelMessageHandler);
     }
+    if (completed) return; // transfer already finished successfully — closing now is normal, not an error
     enqueue(async () => {
       if (writer?.abort) await writer.abort();
       onError?.('connection-lost');
@@ -283,6 +286,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   });
   peer.on('error', (err) => {
     console.error('[receiveFiles] peer error', err);
+    if (completed) return; // ignore late transport errors after a successful transfer
     onError?.('connection-error');
   });
 }

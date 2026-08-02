@@ -25,8 +25,44 @@ export default function HostRoom() {
     filesRef.current = files;
   }, [files]);
 
+  // Stable identity used to resume the SAME room after a socket drop
+  // (backgrounded tab, phone lock, brief network blip) instead of being
+  // treated as a brand new connection. Assumes the page that called
+  // 'create-room' passed hostUserId through navigate(..., { state }) —
+  // falls back to sessionStorage so a refresh doesn't lose it either.
+  const hostUserId = useRef(
+    state?.hostUserId || sessionStorage.getItem(`hostUserId:${roomId}`) || null
+  );
+  useEffect(() => {
+    if (hostUserId.current) {
+      sessionStorage.setItem(`hostUserId:${roomId}`, hostUserId.current);
+    }
+  }, [roomId]);
+
+  const hasConnectedOnce = useRef(false);
+
   useEffect(() => {
     if (!socket.connected) socket.connect();
+
+    // Fires on the FIRST connection too, not just reconnects — we only act
+    // on subsequent ones (socket.io auto-reconnects after a drop).
+    const handleConnect = () => {
+      if (!hasConnectedOnce.current) {
+        hasConnectedOnce.current = true;
+        return;
+      }
+      if (!hostUserId.current) return; // can't resume without our stable id
+
+      socket.emit('rejoin-room', { roomId, userId: hostUserId.current }, (res) => {
+        if (!res?.ok) {
+          toast.error('This session could not be resumed');
+          navigate('/');
+          return;
+        }
+        toast.success('Back online');
+      });
+    };
+    socket.on('connect', handleConnect);
 
     socket.on('peer-joined', ({ peerSocketId, peerUserId }) => {
       toast.success('A new device connected');
@@ -118,6 +154,7 @@ export default function HostRoom() {
     socket.on('disconnect', () => toast.error('Disconnected from server'));
 
     return () => {
+      socket.off('connect', handleConnect);
       socket.off('peer-joined');
       socket.off('signal');
       socket.off('peer-left');

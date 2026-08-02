@@ -28,8 +28,37 @@ export default function JoinRoom() {
     downloadStateRef.current = downloadState;
   }, [downloadState]);
 
+  // Stable identity used to resume the SAME room after a socket drop
+  // (backgrounded tab, phone lock, brief network blip) instead of being
+  // treated as a brand new join. Filled in once join-room's ack returns.
+  const myUserId = useRef(sessionStorage.getItem(`peerUserId:${roomId}`) || null);
+  const hasConnectedOnce = useRef(false);
+
   useEffect(() => {
     if (!socket.connected) socket.connect();
+
+    // Fires on the FIRST connection too, not just reconnects — only act on
+    // subsequent ones (socket.io auto-reconnects after a drop, e.g. briefly
+    // backgrounding the app to share the link).
+    const handleConnect = () => {
+      if (!hasConnectedOnce.current) {
+        hasConnectedOnce.current = true;
+        return;
+      }
+      if (!myUserId.current) return; // can't resume without our stable id
+
+      socket.emit('rejoin-room', { roomId, userId: myUserId.current }, (res) => {
+        if (!res?.ok) {
+          toast.error(res?.error === 'room-not-found' ? 'That room no longer exists' : 'Could not resume the session');
+          navigate('/');
+          return;
+        }
+        toast.success('Back online');
+        if (res.currentOffer) setOffer(res.currentOffer);
+        if (res.expiresAt) setExpiresAt(res.expiresAt);
+      });
+    };
+    socket.on('connect', handleConnect);
 
     socket.emit('join-room', { roomId }, (res) => {
       if (!res?.ok) {
@@ -37,6 +66,8 @@ export default function JoinRoom() {
         navigate('/');
         return;
       }
+      myUserId.current = res.userId;
+      sessionStorage.setItem(`peerUserId:${roomId}`, res.userId);
       setExpiresAt(res.expiresAt);
       if (res.currentOffer) setOffer(res.currentOffer);
       toast.success('Joined session');
@@ -95,6 +126,7 @@ export default function JoinRoom() {
     socket.on('disconnect', () => toast.error('Disconnected from server'));
 
     return () => {
+      socket.off('connect', handleConnect);
       socket.off('signal');
       socket.off('file-offer');
       socket.off('room-closed');
@@ -195,6 +227,7 @@ export default function JoinRoom() {
       },
       onError: (err) => {
         console.error('[receiveFiles onError - JoinRoom]', err);
+        if (downloadStateRef.current === 'complete') return; // already finished successfully — a later peer close/error is expected, not a failure
         if (downloadCallbacks.current?.stallTimer) {
           clearTimeout(downloadCallbacks.current.stallTimer);
           downloadCallbacks.current.stallTimer = null;

@@ -71,6 +71,11 @@ export function registerSignaling(io, roomManager) {
     });
 
     // ---------- REJOIN (reconnect after dropped connection) ----------
+    // Called by the client right after socket.io reconnects (NOT a fresh
+    // join). If this fires within the grace period started by the disconnect
+    // handler below, we cancel the pending close/removal so the room and
+    // (for peers) their membership survive brief drops — backgrounded tabs,
+    // phone lock, flaky network, etc.
     socket.on('rejoin-room', (payload, ack) => {
       const { roomId, userId } = payload || {};
       const room = roomManager.getRoom(roomId);
@@ -83,6 +88,10 @@ export function registerSignaling(io, roomManager) {
         ack?.({ ok: false, error: `room-${room.status}` });
         return;
       }
+      if (!userId) {
+        ack?.({ ok: false, error: 'missing-user-id' });
+        return;
+      }
 
       const wasHost = room.hostUserId === userId;
       socket.join(roomId);
@@ -92,9 +101,11 @@ export function registerSignaling(io, roomManager) {
 
       if (wasHost) {
         room.hostSocketId = socket.id; // host's new socket id after reconnect
+        roomManager.cancelHostDisconnect(roomId);
       } else {
         // refresh member entry under the new socket id, keep same userId
         room.members.set(socket.id, { socketId: socket.id, userId, joinedAt: Date.now(), downloading: new Set() });
+        roomManager.cancelPeerDisconnect(roomId, userId);
       }
 
       ack?.({
@@ -112,7 +123,6 @@ export function registerSignaling(io, roomManager) {
     // ---------- WEBRTC SIGNAL RELAY ----------
     // Pure relay: server never looks at the payload contents, just forwards it
     // to the intended peer so a direct WebRTC connection can be negotiated.
-    // ---------- WEBRTC SIGNAL RELAY ----------
     socket.on('signal', (payload) => {
       const { targetSocketId, signal } = payload || {};
       if (!targetSocketId || !signal) return;
@@ -192,6 +202,7 @@ export function registerSignaling(io, roomManager) {
     });
 
     // ---------- HOST TERMINATES ROOM ----------
+    // Explicit, intentional action — always closes immediately, no grace period.
     socket.on('terminate-room', () => {
       const room = roomManager.getRoom(socket.data.roomId);
       if (!room || room.hostSocketId !== socket.id) return;
@@ -199,13 +210,36 @@ export function registerSignaling(io, roomManager) {
     });
 
     // ---------- LEAVE ----------
+    // Explicit, intentional action (user clicked "Leave") — always immediate,
+    // no grace period. Only an unplanned 'disconnect' (below) gets one.
     socket.on('leave-room', () => {
-      handleLeave(socket, io, roomManager);
+      handleLeave(socket, io, roomManager, { disconnected: false });
     });
 
     // ---------- DISCONNECT ----------
+    // This fires for ANY socket drop — backgrounded tab, phone lock, brief
+    // network blip, or someone actually closing the app. We can't tell those
+    // apart here, so we never act immediately: everyone gets a grace period
+    // to reconnect via 'rejoin-room' before we actually close the room
+    // (host) or remove them (peer). This is what fixes "room already
+    // expired" a few seconds after switching apps to share the link.
     socket.on('disconnect', () => {
-      handleLeave(socket, io, roomManager, { disconnected: true });
+      const roomId = socket.data.roomId;
+      if (!roomId) return;
+      const room = roomManager.getRoom(roomId);
+      if (!room) return;
+
+      if (socket.data.isHost) {
+        roomManager.scheduleHostDisconnect(roomId);
+        socket.to(roomId).emit('peer-disconnected-temporarily', { isHost: true });
+      } else {
+        roomManager.schedulePeerDisconnect(roomId, socket.id, socket.data.userId);
+        io.to(room.hostSocketId).emit('peer-disconnected-temporarily', {
+          peerSocketId: socket.id,
+          peerUserId: socket.data.userId,
+          isHost: false,
+        });
+      }
     });
   });
 }
