@@ -31,8 +31,18 @@ export default function JoinRoom() {
   const downloadStateRef = useRef('idle');
   useEffect(() => { downloadStateRef.current = downloadState; }, [downloadState]);
 
+  // Keep offer in a ref so the effect-internal respond implementation
+  // always reads the current value, not a stale closure capture.
+  const offerRef = useRef(null);
+  useEffect(() => { offerRef.current = offer; }, [offer]);
+
   const myUserId = useRef(sessionStorage.getItem(`peerUserId:${roomId}`) || null);
   const hasJoinedOnce = useRef(false);
+
+  // Ref that holds the actual respond logic — populated inside useEffect
+  // so it has direct access to startReceiveFiles without going through
+  // another ref indirection that can be null at the wrong time.
+  const respondImplRef = useRef(null);
 
   useEffect(() => {
     const clearDownloadState = () => {
@@ -59,7 +69,8 @@ export default function JoinRoom() {
       isReceivingRef.current = false;
 
       // Destroy peer after each download so the next batch gets a fresh
-      // connection — prevents stale data channel listeners from stacking.
+      // connection — prevents stale data channel listeners from stacking
+      // and causing the doubled-toast bug on the 2nd/3rd batch.
       if (hostPeer.current) {
         const oldPeer = hostPeer.current;
         hostPeer.current = null;
@@ -69,7 +80,7 @@ export default function JoinRoom() {
 
     const startReceiveFiles = (mode, fileHandles) => {
       if (!hostPeer.current) {
-        console.error('[startReceiveFiles] no peer');
+        console.error('[startReceiveFiles] no peer — should not happen on direct path');
         clearDownloadState();
         toast.error('Connection lost unexpectedly', { id: 'no-peer-receive' });
         return;
@@ -85,6 +96,8 @@ export default function JoinRoom() {
       }, 30000);
 
       downloadCallbacks.current = { stallTimer };
+
+      console.log('[startReceiveFiles] calling receiveFiles, peer.connected =', hostPeer.current.connected);
 
       receiveFiles({
         peer: hostPeer.current,
@@ -124,19 +137,15 @@ export default function JoinRoom() {
       });
     };
 
-    // ──── REJOIN — same fix as HostRoom: always rejoin, no hasConnectedOnce guard ────
+    // ──── REJOIN ────
     const tryRejoin = () => {
       if (!myUserId.current) return;
 
       const isFirstJoin = !hasJoinedOnce.current;
-      if (!isFirstJoin) {
-        setIsReconnecting(true);
-      }
+      if (!isFirstJoin) setIsReconnecting(true);
 
       socket.emit('rejoin-room', { roomId, userId: myUserId.current }, (res) => {
-        if (!isFirstJoin) {
-          setIsReconnecting(false);
-        }
+        if (!isFirstJoin) setIsReconnecting(false);
         hasJoinedOnce.current = true;
 
         if (!res?.ok) {
@@ -145,9 +154,7 @@ export default function JoinRoom() {
           return;
         }
 
-        if (!isFirstJoin) {
-          toast.success('Back online', { id: 'rejoin-success' });
-        }
+        if (!isFirstJoin) toast.success('Back online', { id: 'rejoin-success' });
 
         if (res.currentOffer && res.currentOffer.offerId !== lastOfferIdRef.current) {
           setOffer(res.currentOffer);
@@ -159,15 +166,13 @@ export default function JoinRoom() {
 
     socket.on('connect', tryRejoin);
 
-    // If socket is already connected, the 'connect' event won't fire again.
-    // Call tryRejoin manually so we sync with the server on mount.
     if (socket.connected) {
       tryRejoin();
     } else {
       socket.connect();
     }
 
-    // ──── Initial join (only runs once — the server assigns us a userId) ────
+    // ──── Initial join ────
     socket.emit('join-room', { roomId }, (res) => {
       if (!res?.ok) {
         toast.error(res?.error === 'room-not-found' ? 'That room does not exist' : 'That room has expired', { id: 'join-fail' });
@@ -186,9 +191,8 @@ export default function JoinRoom() {
 
     // ──── WebRTC signaling ────
     socket.on('signal', ({ fromSocketId, signal }) => {
-      // If we get a signal from a different socketId than our current peer,
-      // the host reconnected with a new socket. Destroy the old peer so we
-      // create a fresh one for the new host connection.
+      // If signal comes from a different socketId than our current peer,
+      // the host reconnected. Destroy old peer so we create a fresh one.
       if (hostPeer.current && hostPeer.current._options?.targetSocketId !== fromSocketId) {
         console.log('[signal] from new socketId', fromSocketId, '— destroying old peer');
         hostPeer.current.destroy();
@@ -220,6 +224,9 @@ export default function JoinRoom() {
           toast.success('Direct connection established', { id: 'peer-connected' });
           hostRetryCount.current = 0;
 
+          // If we accepted a file offer and are waiting for a fresh peer
+          // connection (because we destroyed the old one after the previous
+          // download), now's the time to start receiving.
           if (waitingForPeerRef.current && pendingDownloadConfig.current) {
             waitingForPeerRef.current = false;
             const { mode, fileHandles } = pendingDownloadConfig.current;
@@ -265,7 +272,10 @@ export default function JoinRoom() {
       if (incomingOffer.offerId === lastOfferIdRef.current) return;
       lastOfferIdRef.current = incomingOffer.offerId;
 
+      // Full reset for a fresh offer — clears leftover state from any
+      // previous download so the new one starts clean.
       clearDownloadState();
+
       toast.success('The host wants to send you files', { id: 'file-offer-toast' });
       setOffer(incomingOffer);
     });
@@ -284,8 +294,92 @@ export default function JoinRoom() {
       console.log('[socket disconnect] connection dropped, will auto-recover…');
     });
 
-    // Expose for the respond function
-    respondRef.current = { clearDownloadState, startReceiveFiles };
+    // ──── Store the respond implementation INSIDE the effect ────
+    // This is the key structural fix: respond needs direct access to
+    // startReceiveFiles (which is also in this effect). Using a ref
+    // indirection (respondRef.current?.startReceiveFiles) was fragile
+    // and could be null at the exact moment the user clicked download.
+    respondImplRef.current = async (accept, mode) => {
+      const currentOffer = offerRef.current;
+      if (!currentOffer) return;
+
+      if (accept && isReceivingRef.current) {
+        toast('Download already in progress', { icon: '⚠️', id: 'already-receiving' });
+        return;
+      }
+
+      let fileHandles = null;
+
+      if (accept && mode === 'individual' && 'showSaveFilePicker' in window) {
+        fileHandles = new Map();
+        try {
+          for (const f of currentOffer.files) {
+            const handle = await window.showSaveFilePicker({ suggestedName: f.name });
+            fileHandles.set(f.id, handle);
+          }
+        } catch (err) {
+          if (err?.name === 'AbortError') {
+            toast.error('No save location selected — download cancelled', { id: 'save-cancelled' });
+            socket.emit('file-response', { accept: false, mode, offerId: currentOffer.offerId });
+            setOffer(null);
+            lastOfferIdRef.current = null;
+            return;
+          }
+          console.warn('[respond] showSaveFilePicker unavailable, falling back to blob download', err);
+          fileHandles = null;
+        }
+      }
+
+      socket.emit('file-response', { accept, mode, offerId: currentOffer.offerId });
+      setOffer(null);
+      lastOfferIdRef.current = null;
+
+      if (!accept) return;
+
+      isReceivingRef.current = true;
+      setDownloadState('downloading');
+      setProgress(0);
+      hasReceivedData.current = false;
+
+      // ──── THE CRITICAL FIX ────
+      // Use simple-peer's PUBLIC `connected` property (a getter that
+      // internally checks both the RTCPeerConnection state AND the data
+      // channel readyState). The previous code reached into the private
+      // `_channel` property which either doesn't exist in some versions
+      // or returns unexpected values, causing this check to ALWAYS fail.
+      // That made every download — even the first one — fall into the
+      // "wait for peer" path and hit the 30-second timeout error.
+      if (hostPeer.current && !hostPeer.current.destroyed && hostPeer.current.connected) {
+        console.log('[respond] peer is ready — receiving directly');
+        startReceiveFiles(mode, fileHandles);
+        return;
+      }
+
+      // Peer doesn't exist (we destroyed it after the previous download)
+      // or isn't connected yet. Store the config and wait for the host
+      // to re-initiate signaling — the peer's 'connect' handler above
+      // will pick up pendingDownloadConfig and call startReceiveFiles.
+      console.log('[respond] peer NOT ready — waiting for host to re-initiate', {
+        exists: !!hostPeer.current,
+        destroyed: hostPeer.current?.destroyed,
+        connected: hostPeer.current?.connected,
+      });
+      waitingForPeerRef.current = true;
+      pendingDownloadConfig.current = { mode, fileHandles };
+
+      const stallTimer = setTimeout(() => {
+        if (waitingForPeerRef.current) {
+          console.error('[respond] timed out waiting for peer connection');
+          toast.error('Connection to host lost — the host may need to re-send the files', { id: 'peer-timeout' });
+          isReceivingRef.current = false;
+          waitingForPeerRef.current = false;
+          pendingDownloadConfig.current = null;
+          setDownloadState('idle');
+          setProgress(null);
+        }
+      }, 30000);
+      downloadCallbacks.current = { stallTimer };
+    };
 
     return () => {
       socket.off('connect', tryRejoin);
@@ -299,76 +393,19 @@ export default function JoinRoom() {
         clearTimeout(downloadCallbacks.current.stallTimer);
       }
       hostPeer.current?.destroy();
+      respondImplRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  const respondRef = useRef(null);
-
+  // Public respond function — thin wrapper that delegates to the
+  // implementation stored inside the effect. This is what FileOfferModal
+  // calls when the user clicks Download or Decline.
   const respond = async (accept, mode) => {
-    if (accept && isReceivingRef.current) {
-      toast('Download already in progress', { icon: '⚠️', id: 'already-receiving' });
-      return;
+    if (respondImplRef.current) {
+      return respondImplRef.current(accept, mode);
     }
-
-    let fileHandles = null;
-
-    if (accept && mode === 'individual' && 'showSaveFilePicker' in window) {
-      fileHandles = new Map();
-      try {
-        for (const f of offer.files) {
-          const handle = await window.showSaveFilePicker({ suggestedName: f.name });
-          fileHandles.set(f.id, handle);
-        }
-      } catch (err) {
-        if (err?.name === 'AbortError') {
-          toast.error('No save location selected — download cancelled', { id: 'save-cancelled' });
-          socket.emit('file-response', { accept: false, mode, offerId: offer.offerId });
-          setOffer(null);
-          lastOfferIdRef.current = null;
-          return;
-        }
-        console.warn('[respond] showSaveFilePicker unavailable, falling back to blob download', err);
-        fileHandles = null;
-      }
-    }
-
-    socket.emit('file-response', { accept, mode, offerId: offer.offerId });
-    setOffer(null);
-    lastOfferIdRef.current = null;
-
-    if (!accept) return;
-
-    isReceivingRef.current = true;
-    waitingForPeerRef.current = true;
-    pendingDownloadConfig.current = { mode, fileHandles };
-    setDownloadState('downloading');
-    setProgress(0);
-    hasReceivedData.current = false;
-
-    // If peer is already live, start immediately
-    if (hostPeer.current && hostPeer.current.connected && hostPeer.current._channel?.readyState === 'open') {
-      waitingForPeerRef.current = false;
-      const { mode: m, fileHandles: fh } = pendingDownloadConfig.current;
-      pendingDownloadConfig.current = null;
-      respondRef.current?.startReceiveFiles(m, fh);
-      return;
-    }
-
-    // Otherwise wait for the host to re-initiate signaling (peer 'connect'
-    // handler will pick up pendingDownloadConfig). Start a safety timer.
-    const stallTimer = setTimeout(() => {
-      if (waitingForPeerRef.current) {
-        console.error('[respond] timed out waiting for peer connection');
-        toast.error('Connection to host lost — waiting for reconnection…', { id: 'peer-timeout' });
-        isReceivingRef.current = false;
-        waitingForPeerRef.current = false;
-        pendingDownloadConfig.current = null;
-        setDownloadState('idle');
-        setProgress(null);
-      }
-    }, 30000);
-    downloadCallbacks.current = { stallTimer };
+    toast.error('Not connected yet — please wait', { id: 'not-ready' });
   };
 
   const leaveSession = () => {
