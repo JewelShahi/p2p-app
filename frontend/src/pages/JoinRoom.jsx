@@ -17,6 +17,7 @@ export default function JoinRoom() {
   const [progress, setProgress] = useState(null);
   const [downloadState, setDownloadState] = useState('idle'); // idle | downloading | complete
   const hostPeer = useRef(null);
+  const hostRetryCount = useRef(0); // reset on success; used to know when to stop hoping and show a real error
   const downloadCallbacks = useRef(null);
   const hasReceivedData = useRef(false);
 
@@ -81,11 +82,32 @@ export default function JoinRoom() {
           targetSocketId: fromSocketId,
           onFailed: (state) => {
             console.error('[peer onFailed - JoinRoom]', state);
-            toast.error(`Connection to host ${state} — likely blocked by your network (try a different network or a TURN server)`);
+
+            hostPeer.current?.destroy();
+            hostPeer.current = null;
+
+            const attempts = hostRetryCount.current + 1;
+            hostRetryCount.current = attempts;
+
+            // This is the fix for "backgrounded briefly, comes back dead":
+            // the WebRTC connection (not necessarily the socket) often dies
+            // on a backgrounded mobile tab. We're not the initiator, so we
+            // don't rebuild it ourselves — the host detects its own side
+            // failing the same way and automatically re-initiates. We just
+            // need to clear the dead connection so the next 'signal' event
+            // builds a fresh one instead of erroring forever.
+            if (attempts > 3) {
+              toast.error(`Connection to host ${state} — likely blocked by your network (try a different network or a TURN server)`);
+              return;
+            }
+            toast('Reconnecting to host…', { icon: '🔄' });
           },
         });
 
-        hostPeer.current.on('connect', () => toast.success('Direct connection established'));
+        hostPeer.current.on('connect', () => {
+          toast.success('Direct connection established');
+          hostRetryCount.current = 0;
+        });
 
         hostPeer.current.on('error', (err) => {
           console.error('[peer error - JoinRoom]', err);

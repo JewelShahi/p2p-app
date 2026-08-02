@@ -20,6 +20,7 @@ export default function HostRoom() {
   const [transfers, setTransfers] = useState({});
 
   const peerConnections = useRef({});
+  const peerRetryCount = useRef({}); // peerSocketId -> failed-attempt count, so we self-heal instead of just erroring out
   const filesRef = useRef([]);
   useEffect(() => {
     filesRef.current = files;
@@ -62,13 +63,41 @@ export default function HostRoom() {
         targetSocketId: peerSocketId,
         onFailed: (state) => {
           console.error('[peer onFailed - HostRoom]', peerSocketId, state);
-          toast.error(`Connection to a peer ${state} — likely blocked by their network`);
+
+          // Tear down the dead connection either way.
+          peerConnections.current[peerSocketId]?.destroy();
+          delete peerConnections.current[peerSocketId];
+
+          const attempts = (peerRetryCount.current[peerSocketId] || 0) + 1;
+          peerRetryCount.current[peerSocketId] = attempts;
+
+          // This is the actual fix for "backgrounded for 20s, comes back
+          // dead": the WebRTC connection itself (not necessarily the
+          // socket) often dies when a mobile tab is backgrounded. Instead
+          // of just showing an alarming error and leaving it broken, we
+          // (the initiator) automatically rebuild it — up to a few tries —
+          // so both sides come back live with no manual action needed.
+          if (attempts > 3) {
+            toast.error(`Connection to a peer ${state} — likely blocked by their network`);
+            return;
+          }
+
+          toast('Reconnecting to a device…', { icon: '🔄' });
+          setTimeout(() => {
+            // Only retry if that peer is still actually part of the room.
+            if (peersRef.current.some((p) => p.socketId === peerSocketId)) {
+              connectToPeer(peerSocketId);
+            }
+          }, 1000);
         },
       });
 
       peerConnections.current[peerSocketId] = peer;
 
-      peer.on('connect', () => toast.success('Direct connection established'));
+      peer.on('connect', () => {
+        toast.success('Direct connection established');
+        peerRetryCount.current[peerSocketId] = 0; // reset — this attempt succeeded
+      });
 
       peer.on('error', (err) => {
         console.error('[peer error - HostRoom]', peerSocketId, err);
