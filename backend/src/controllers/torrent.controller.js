@@ -12,19 +12,56 @@ const isValidTorrentSource = (source) => {
   return trimmed.startsWith('magnet:') || trimmed.startsWith('http://') || trimmed.startsWith('https://');
 };
 
-// Safely adds a torrent. 
-// NOTE: We do NOT use client.get() here because it behaves unpredictably 
-// with URLs vs infoHashes. client.add() natively handles duplicates anyway — 
-// if the torrent is already active, it just calls the callback with it.
 function getOrAdd(source, onTorrent, onError) {
   try {
+    // 1. Check if WebTorrent already knows about this torrent.
+    // client.get() can return a Torrent object OR just an infoHash string
+    // depending on the WebTorrent version, so we handle both.
+    const existing = client.get(source);
+    let existingTorrent = null;
+
+    if (existing) {
+      if (typeof existing === 'object' && typeof existing.once === 'function') {
+        // It's a valid torrent object
+        existingTorrent = existing;
+      } else if (typeof existing === 'string') {
+        // It's just the infoHash string — find the actual object in the client's list
+        existingTorrent = client.torrents.find(t => t.infoHash === existing) || null;
+      }
+    }
+
+    if (existingTorrent) {
+      if (existingTorrent.ready) {
+        onTorrent(existingTorrent);
+      } else {
+        existingTorrent.once('ready', () => onTorrent(existingTorrent));
+        existingTorrent.once('error', (err) => {
+          console.error('[getOrAdd existing error]', err.message);
+          onError?.(err);
+        });
+      }
+      return; // Stop here, we found it!
+    }
+
+    // 2. If not found, add it
     const torrent = client.add(source, { destroyStoreOnDestroy: true }, (t) => {
       onTorrent(t);
     });
 
-    // Catch errors during handshake/metadata resolution
+    // 3. Catch errors that happen DURING handshake
     torrent.on('error', (err) => {
-      console.error('[getOrAdd error]', err.message);
+      // If it failed because it was actually added in a race condition,
+      // try to recover by finding it in the client's active list.
+      if (err.message && err.message.includes('Cannot add duplicate')) {
+        console.log('[getOrAdd] Recovering from duplicate add...');
+        const dup = client.torrents.find(t => t.infoHash === existing) || client.torrents[client.torrents.length - 1];
+        if (dup) {
+          if (dup.ready) onTorrent(dup);
+          else dup.once('ready', () => onTorrent(dup));
+          return;
+        }
+      }
+      console.error('[getOrAdd new error]', err.message);
       onError?.(err);
     });
 
@@ -34,7 +71,7 @@ function getOrAdd(source, onTorrent, onError) {
   }
 }
 
-// Helper to safely send a response exactly once (prevents ERR_HTTP_HEADERS_SENT)
+// Helper to safely send a response exactly once
 const safeResponse = (res, settledRef, timeoutRef) => ({
   success: (data) => {
     if (settledRef.current) return;
