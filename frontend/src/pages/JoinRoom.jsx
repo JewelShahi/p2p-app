@@ -40,14 +40,26 @@ export default function JoinRoom() {
           initiator: false,
           socket,
           targetSocketId: fromSocketId,
-          onFailed: (state) => toast.error(`Connection to host ${state} — likely blocked by your network (try a different network or a TURN server)`),
+          onFailed: (state) => {
+            console.error('[peer onFailed - JoinRoom]', state);
+            toast.error(`Connection to host ${state} — likely blocked by your network (try a different network or a TURN server)`);
+          },
         });
-        
+
         hostPeer.current.on('connect', () => toast.success('Direct connection established'));
-        hostPeer.current.on('error', () => toast.error('Connection to host failed'));
-        
+
+        hostPeer.current.on('error', (err) => {
+          console.error('[peer error - JoinRoom]', err);
+          toast.error('Connection to host failed');
+        });
+
+        hostPeer.current.on('iceStateChange', (state) => {
+          console.log('[ICE state - JoinRoom]', state);
+        });
+
         // Fallback: If peer closes during download, mark as complete
         hostPeer.current.on('close', () => {
+          console.log('[peer close - JoinRoom]', { downloadState, hasReceivedData: hasReceivedData.current });
           if (downloadState === 'downloading' || hasReceivedData.current) {
             handleDownloadComplete();
           }
@@ -121,6 +133,7 @@ export default function JoinRoom() {
     const stallTimer = setTimeout(() => {
       // If we haven't received any data at all, it's actually stalled
       if (!hasReceivedData.current) {
+        console.error('[download stalled - JoinRoom] no data received within 30s');
         toast.error('Download stalled — connection may have dropped');
         setDownloadState('idle');
         setProgress(null);
@@ -141,9 +154,9 @@ export default function JoinRoom() {
         hasReceivedData.current = true;
         if (stallTimer) clearTimeout(stallTimer);
         downloadCallbacks.current.stallTimer = null;
-        
+
         setProgress(Math.min(Math.max(p, 0), 1));
-        
+
         // If progress reaches 100%, complete immediately
         if (p >= 1) {
           handleDownloadComplete();
@@ -153,7 +166,8 @@ export default function JoinRoom() {
         handleDownloadComplete();
         toast.success('Download complete');
       },
-      onError: () => {
+      onError: (err) => {
+        console.error('[receiveFiles onError - JoinRoom]', err);
         if (downloadCallbacks.current?.stallTimer) {
           clearTimeout(downloadCallbacks.current.stallTimer);
           downloadCallbacks.current.stallTimer = null;
@@ -197,8 +211,8 @@ export default function JoinRoom() {
         </div>
 
         <div className="flex-none ml-4">
-          <button 
-            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error" 
+          <button
+            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error"
             onClick={leaveSession}
           >
             <LogOut size={15} />
@@ -221,10 +235,10 @@ export default function JoinRoom() {
             <div className="card-body p-5 gap-4">
               <div className="flex items-center gap-3">
                 <div className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors duration-300 ${
-                  downloadState === 'complete' 
-                    ? 'bg-success/10' 
-                    : downloadState === 'downloading' 
-                      ? 'bg-primary/10' 
+                  downloadState === 'complete'
+                    ? 'bg-success/10'
+                    : downloadState === 'downloading'
+                      ? 'bg-primary/10'
                       : 'bg-base-200/70'
                 }`}>
                   {downloadState === 'complete' ? (
@@ -236,10 +250,10 @@ export default function JoinRoom() {
                   )}
                 </div>
                 <h2 className="card-title text-sm font-semibold">
-                  {downloadState === 'complete' 
-                    ? 'Downloaded' 
-                    : downloadState === 'downloading' 
-                      ? 'Receiving Files' 
+                  {downloadState === 'complete'
+                    ? 'Downloaded'
+                    : downloadState === 'downloading'
+                      ? 'Receiving Files'
                       : 'Waiting for Host'}
                 </h2>
                 {downloadState === 'downloading' && (
@@ -291,7 +305,7 @@ export default function JoinRoom() {
 
         {/* ── Side Panel (Right / Small) ── */}
         <div className="md:col-span-4 flex flex-col gap-4 lg:gap-5">
-          
+
           {/* Session Info Card */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 gap-4">
@@ -301,13 +315,13 @@ export default function JoinRoom() {
                 </div>
                 <h2 className="card-title text-sm font-semibold">Session</h2>
               </div>
-              
+
               <div className="space-y-3">
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-base-content/40">Status</span>
                   <span className={`badge badge-sm gap-1 ${
-                    downloadState === 'downloading' 
-                      ? 'badge-primary' 
+                    downloadState === 'downloading'
+                      ? 'badge-primary'
                       : downloadState === 'complete'
                         ? 'badge-success'
                         : 'badge-success'
@@ -336,8 +350,8 @@ export default function JoinRoom() {
                   Safely disconnect from the host and return to the home screen.
                 </p>
               </div>
-              <button 
-                className="btn btn-error btn-outline w-full gap-2" 
+              <button
+                className="btn btn-error btn-outline w-full gap-2"
                 onClick={leaveSession}
               >
                 <LogOut size={16} />
@@ -351,7 +365,7 @@ export default function JoinRoom() {
 
       {/* ── Modal Trigger (Rendered outside grid) ── */}
       <FileOfferModal offer={offer} onRespond={respond} />
-      
+
     </div>
   );
 }

@@ -32,14 +32,29 @@ export default function HostRoom() {
         initiator: true,
         socket,
         targetSocketId: peerSocketId,
-        onFailed: (state) => toast.error(`Connection to a peer ${state} — likely blocked by their network`),
+        onFailed: (state) => {
+          console.error('[peer onFailed - HostRoom]', peerSocketId, state);
+          toast.error(`Connection to a peer ${state} — likely blocked by their network`);
+        },
       });
 
       peerConnections.current[peerSocketId] = peer;
 
       peer.on('connect', () => toast.success('Direct connection established'));
-      peer.on('error', () => toast.error('Connection to a peer failed'));
-      peer.on('close', () => delete peerConnections.current[peerSocketId]);
+
+      peer.on('error', (err) => {
+        console.error('[peer error - HostRoom]', peerSocketId, err);
+        toast.error('Connection to a peer failed');
+      });
+
+      peer.on('iceStateChange', (state) => {
+        console.log('[ICE state - HostRoom]', peerSocketId, state);
+      });
+
+      peer.on('close', () => {
+        console.log('[peer close - HostRoom]', peerSocketId);
+        delete peerConnections.current[peerSocketId];
+      });
     });
 
     socket.on('signal', ({ fromSocketId, signal }) => {
@@ -78,7 +93,8 @@ export default function HostRoom() {
           setTransfers((t) => ({ ...t, [fromSocketId]: 1 }));
         },
         onCancel: () => toast('Peer cancelled the download', { icon: '🛑' }),
-        onError: () => {
+        onError: (err) => {
+          console.error('[sendFiles onError - HostRoom]', fromSocketId, err);
           toast.error('Send failed — connection to that peer was not ready');
           setTransfers((t) => {
             const copy = { ...t };
@@ -163,8 +179,8 @@ export default function HostRoom() {
         </div>
 
         <div className="flex-none ml-4">
-          <button 
-            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error" 
+          <button
+            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error"
             onClick={terminateRoom}
           >
             <Power size={15} />
@@ -198,7 +214,7 @@ export default function HostRoom() {
 
         {/* ── Stats Cluster (2 mini cards) ── */}
         <div className="md:col-span-7 lg:col-span-4 grid grid-cols-2 gap-4 lg:gap-5">
-          
+
           {/* Connected Devices */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 items-center text-center gap-2">
@@ -237,7 +253,7 @@ export default function HostRoom() {
                 </div>
                 <h2 className="card-title text-sm font-semibold">Transfers</h2>
               </div>
-              
+
               {Object.entries(transfers).length > 0 ? (
                 <div className="space-y-3">
                   {Object.entries(transfers).map(([socketId, progress]) => (
@@ -265,7 +281,7 @@ export default function HostRoom() {
         <div className="md:col-span-8 lg:col-span-8">
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 gap-4">
-              
+
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center">
@@ -320,12 +336,12 @@ export default function HostRoom() {
         <div className="md:col-span-4 lg:col-span-4">
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
             <div className="card-body p-5 gap-4 justify-between">
-              
+
               <div>
                 <h2 className="text-sm font-semibold mb-1">Ready to send?</h2>
                 <p className="text-xs text-base-content/40 leading-relaxed">
-                  {peers.length === 0 
-                    ? 'Share the room link and wait for devices to connect.' 
+                  {peers.length === 0
+                    ? 'Share the room link and wait for devices to connect.'
                     : `${peers.length} device${peers.length > 1 ? 's are' : ' is'} waiting. ${files.length === 0 ? 'Add files to begin.' : 'Hit send to start.'}`
                   }
                 </p>
