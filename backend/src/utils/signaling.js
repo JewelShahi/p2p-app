@@ -1,16 +1,16 @@
+// signaling.js
 import { v4 as uuidv4 } from 'uuid';
 import { isValidDuration, DEFAULT_DURATION } from './roomManager.js';
 
-// Total size cap per offer, regardless of how many files make it up.
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024; // 10GB
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024;
 
 export function registerSignaling(io, roomManager) {
   io.on('connection', (socket) => {
-    // Track which room this socket belongs to and whether it's the host
     socket.data.roomId = null;
     socket.data.isHost = false;
+    socket.data.userId = null;
 
-    // ---------- CREATE ROOM (host clicks "Start session") ----------
+    // ---------- CREATE ROOM ----------
     socket.on('create-room', (payload, ack) => {
       const durationMinutes = isValidDuration(payload?.durationMinutes)
         ? payload.durationMinutes
@@ -35,7 +35,7 @@ export function registerSignaling(io, roomManager) {
       });
     });
 
-    // ---------- JOIN ROOM (peer opens the shared link) ----------
+    // ---------- JOIN ROOM ----------
     socket.on('join-room', (payload, ack) => {
       const { roomId } = payload || {};
       const room = roomManager.getRoom(roomId);
@@ -57,12 +57,9 @@ export function registerSignaling(io, roomManager) {
         userId: member.userId,
         expiresAt: room.expiresAt,
         remainingSeconds: roomManager.remainingSeconds(roomId),
-        // If host already made an offer before this peer joined, send it immediately
         currentOffer: room.currentOffer,
       });
 
-      // Tell the host a new peer connected, so the host's UI can show them
-      // and WebRTC signaling can begin (host is the "initiator" side per peer)
       io.to(room.hostSocketId).emit('peer-joined', {
         peerSocketId: socket.id,
         peerUserId: member.userId,
@@ -70,12 +67,7 @@ export function registerSignaling(io, roomManager) {
       });
     });
 
-    // ---------- REJOIN (reconnect after dropped connection) ----------
-    // Called by the client right after socket.io reconnects (NOT a fresh
-    // join). If this fires within the grace period started by the disconnect
-    // handler below, we cancel the pending close/removal so the room and
-    // (for peers) their membership survive brief drops — backgrounded tabs,
-    // phone lock, flaky network, etc.
+    // ---------- REJOIN ROOM ----------
     socket.on('rejoin-room', (payload, ack) => {
       const { roomId, userId } = payload || {};
       const room = roomManager.getRoom(roomId);
@@ -100,11 +92,22 @@ export function registerSignaling(io, roomManager) {
       socket.data.userId = userId;
 
       if (wasHost) {
-        room.hostSocketId = socket.id; // host's new socket id after reconnect
+        room.hostSocketId = socket.id;
         roomManager.cancelHostDisconnect(roomId);
       } else {
-        // refresh member entry under the new socket id, keep same userId
-        room.members.set(socket.id, { socketId: socket.id, userId, joinedAt: Date.now(), downloading: new Set() });
+        // KEY FIX: Remove ALL old member entries for this userId before
+        // adding the new one. Without this, room.members accumulates ghost
+        // entries (old socketId + new socketId for the same user), which
+        // causes the host to see duplicate peers and try signaling to dead
+        // sockets after a reconnect.
+        roomManager.removeMemberByUserId(roomId, userId);
+
+        room.members.set(socket.id, {
+          socketId: socket.id,
+          userId,
+          joinedAt: Date.now(),
+          downloading: new Set(),
+        });
         roomManager.cancelPeerDisconnect(roomId, userId);
       }
 
@@ -115,35 +118,28 @@ export function registerSignaling(io, roomManager) {
         expiresAt: room.expiresAt,
         remainingSeconds: roomManager.remainingSeconds(roomId),
         currentOffer: room.currentOffer,
-        // Host needs the current member list to rebuild its peers UI and
-        // re-establish WebRTC connections after a reconnect wiped its local
-        // React state — a plain 'rejoin-room' ack alone isn't enough.
-        members: wasHost
-          ? Array.from(room.members.values()).map((m) => ({ socketId: m.socketId, userId: m.userId }))
-          : undefined,
+        // Only return members whose sockets are ACTUALLY connected right now.
+        // This prevents the host from trying to signal to dead sockets.
+        members: wasHost ? roomManager.getLiveMembers(roomId) : undefined,
       });
 
-      // Include the reconnecting party's NEW socket id so the other side(s)
-      // can tear down any stale peer connection (keyed by the old socket id)
-      // and start a fresh WebRTC handshake instead of silently doing nothing.
-      socket.to(roomId).emit('peer-reconnected', { userId, isHost: wasHost, socketId: socket.id });
+      socket.to(roomId).emit('peer-reconnected', {
+        userId,
+        isHost: wasHost,
+        socketId: socket.id,
+      });
     });
 
     // ---------- WEBRTC SIGNAL RELAY ----------
-    // Pure relay: server never looks at the payload contents, just forwards it
-    // to the intended peer so a direct WebRTC connection can be negotiated.
     socket.on('signal', (payload) => {
       const { targetSocketId, signal } = payload || {};
       if (!targetSocketId || !signal) return;
 
       const senderRoomId = socket.data.roomId;
-      if (!senderRoomId) return; // Sender isn't in a valid room
+      if (!senderRoomId) return;
 
-      // Retrieve target socket and verify it exists in the same room
       const targetSocket = io.sockets.sockets.get(targetSocketId);
-      if (!targetSocket || targetSocket.data.roomId !== senderRoomId) {
-        return; // Block cross-room signaling or unauthorized targeting
-      }
+      if (!targetSocket || targetSocket.data.roomId !== senderRoomId) return;
 
       io.to(targetSocketId).emit('signal', {
         fromSocketId: socket.id,
@@ -152,18 +148,13 @@ export function registerSignaling(io, roomManager) {
     });
 
     // ---------- HOST MAKES A FILE OFFER ----------
-    // files: [{ id, name, size }], totalSize in bytes
     socket.on('file-offer', (payload) => {
       const roomId = socket.data.roomId;
       const room = roomManager.getRoom(roomId);
-      // Identify the host by stable userId, not the live hostSocketId — the
-      // latter can be momentarily out of sync right after a reconnect and
-      // would silently reject a legitimate host action with no feedback.
       if (!room || socket.data.userId !== room.hostUserId) return;
 
       const totalSize = payload?.totalSize || 0;
       if (totalSize > MAX_UPLOAD_BYTES) {
-        // Reject before broadcasting to peers — count of files doesn't matter, only total bytes.
         socket.emit('file-offer-error', {
           error: 'upload-too-large',
           maxBytes: MAX_UPLOAD_BYTES,
@@ -179,13 +170,10 @@ export function registerSignaling(io, roomManager) {
         createdAt: Date.now(),
       };
       roomManager.extendOrSetOffer(roomId, offer);
-
-      // Broadcast to every connected peer (not the host itself)
       socket.to(roomId).emit('file-offer', offer);
     });
 
     // ---------- PEER RESPONDS TO OFFER ----------
-    // mode: 'individual' | 'zip'
     socket.on('file-response', (payload) => {
       const { accept, mode, offerId } = payload || {};
       const room = roomManager.getRoom(socket.data.roomId);
@@ -200,24 +188,19 @@ export function registerSignaling(io, roomManager) {
       });
     });
 
-    // ---------- TRANSFER STATUS RELAY (progress / complete / error / cancel) ----------
-    // Used so host <-> peer UIs can reflect state; actual bytes flow peer-to-peer directly.
+    // ---------- TRANSFER STATUS RELAY ----------
     socket.on('transfer-status', (payload) => {
       const { targetSocketId, status, fileId, progress } = payload || {};
       if (!targetSocketId) return;
       io.to(targetSocketId).emit('transfer-status', {
         fromSocketId: socket.id,
-        status, // 'downloading' | 'complete' | 'error' | 'cancelled'
+        status,
         fileId,
         progress,
       });
     });
 
     // ---------- HOST TERMINATES ROOM ----------
-    // Explicit, intentional action — always closes immediately, no grace period.
-    // Now acknowledges success/failure — previously this failed silently if
-    // the host's live socket id was even momentarily out of sync (e.g. right
-    // after a reconnect), leaving the room open with no indication to the host.
     socket.on('terminate-room', (payload, ack) => {
       const room = roomManager.getRoom(socket.data.roomId);
       if (!room) {
@@ -232,20 +215,12 @@ export function registerSignaling(io, roomManager) {
       ack?.({ ok: true });
     });
 
-    // ---------- LEAVE ----------
-    // Explicit, intentional action (user clicked "Leave") — always immediate,
-    // no grace period. Only an unplanned 'disconnect' (below) gets one.
+    // ---------- LEAVE (explicit) ----------
     socket.on('leave-room', () => {
       handleLeave(socket, io, roomManager, { disconnected: false });
     });
 
-    // ---------- DISCONNECT ----------
-    // This fires for ANY socket drop — backgrounded tab, phone lock, brief
-    // network blip, or someone actually closing the app. We can't tell those
-    // apart here, so we never act immediately: everyone gets a grace period
-    // to reconnect via 'rejoin-room' before we actually close the room
-    // (host) or remove them (peer). This is what fixes "room already
-    // expired" a few seconds after switching apps to share the link.
+    // ---------- DISCONNECT (unplanned) ----------
     socket.on('disconnect', () => {
       const roomId = socket.data.roomId;
       if (!roomId) return;
@@ -274,7 +249,6 @@ function handleLeave(socket, io, roomManager, { disconnected = false } = {}) {
   if (!room) return;
 
   if (socket.data.isHost) {
-    // Host leaving/disconnecting closes the whole room for everyone.
     roomManager.closeRoom(roomId, disconnected ? 'host-disconnected' : 'terminated');
   } else {
     roomManager.removeMember(roomId, socket.id);

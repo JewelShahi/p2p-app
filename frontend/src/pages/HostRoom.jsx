@@ -1,3 +1,4 @@
+// HostRoom.jsx
 import { useEffect, useRef, useState } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
@@ -18,19 +19,14 @@ export default function HostRoom() {
   const [peers, setPeers] = useState([]);
   const [files, setFiles] = useState([]);
   const [transfers, setTransfers] = useState({});
+  const [isReconnecting, setIsReconnecting] = useState(false);
 
   const peerConnections = useRef({});
-  const peerRetryCount = useRef({}); // peerSocketId -> failed-attempt count, so we self-heal instead of just erroring out
+  const peerRetryCount = useRef({});
+  const pendingSends = useRef({}); // socketId -> { files } — waiting for fresh peer to connect before sending
   const filesRef = useRef([]);
-  useEffect(() => {
-    filesRef.current = files;
-  }, [files]);
+  useEffect(() => { filesRef.current = files; }, [files]);
 
-  // Stable identity used to resume the SAME room after a socket drop
-  // (backgrounded tab, phone lock, brief network blip) instead of being
-  // treated as a brand new connection. Assumes the page that called
-  // 'create-room' passed hostUserId through navigate(..., { state }) —
-  // falls back to sessionStorage so a refresh doesn't lose it either.
   const hostUserId = useRef(
     state?.hostUserId || sessionStorage.getItem(`hostUserId:${roomId}`) || null
   );
@@ -41,50 +37,46 @@ export default function HostRoom() {
   }, [roomId]);
 
   const hasConnectedOnce = useRef(false);
-
-  // Mirror of `peers` readable inside socket handlers set up once at mount
-  // (their closures would otherwise only ever see the initial empty array).
   const peersRef = useRef([]);
-  useEffect(() => {
-    peersRef.current = peers;
-  }, [peers]);
+  useEffect(() => { peersRef.current = peers; }, [peers]);
 
   useEffect(() => {
     if (!socket.connected) socket.connect();
 
-    // Creates (or re-creates) a WebRTC connection to a peer. Used for a
-    // brand-new join, for rebuilding connections after the host itself
-    // reconnects, and for redoing a specific peer's connection after THEY
-    // reconnect under a new socket id.
+    // Check if a peer connection is actually usable for sending data
+    const isPeerReady = (peer) => {
+      return peer && !peer.destroyed && peer.connected &&
+             peer._channel && peer._channel.readyState === 'open';
+    };
+
     const connectToPeer = (peerSocketId) => {
+      // If there's a pending send for this socketId from a previous attempt,
+      // carry it forward so the new connection picks it up when it connects.
+      const existingPending = pendingSends.current[peerSocketId];
+
       const peer = createPeerConnection({
         initiator: true,
         socket,
         targetSocketId: peerSocketId,
-        onFailed: (state) => {
-          console.error('[peer onFailed - HostRoom]', peerSocketId, state);
+        onFailed: (failState) => {
+          console.error('[peer onFailed - HostRoom]', peerSocketId, failState);
 
-          // Tear down the dead connection either way.
           peerConnections.current[peerSocketId]?.destroy();
           delete peerConnections.current[peerSocketId];
+          delete pendingSends.current[peerSocketId];
 
           const attempts = (peerRetryCount.current[peerSocketId] || 0) + 1;
           peerRetryCount.current[peerSocketId] = attempts;
 
-          // This is the actual fix for "backgrounded for 20s, comes back
-          // dead": the WebRTC connection itself (not necessarily the
-          // socket) often dies when a mobile tab is backgrounded. Instead
-          // of just showing an alarming error and leaving it broken, we
-          // (the initiator) automatically rebuild it — up to a few tries —
-          // so both sides come back live with no manual action needed.
           if (attempts > 3) {
-            toast.error(`Connection to a peer ${state} — likely blocked by their network`);
+            toast.error(`Connection to a peer failed — likely blocked by their network`, { id: 'peer-fail-final' });
+            // Clear any transfer progress for this peer
+            setTransfers((t) => { const c = { ...t }; delete c[peerSocketId]; return c; });
             return;
           }
 
-          toast('Reconnecting to a device…', { icon: '🔄' });
+          toast('Reconnecting to a device…', { icon: '🔄', id: 'peer-retrying' });
           setTimeout(() => {
-            // Only retry if that peer is still actually part of the room.
             if (peersRef.current.some((p) => p.socketId === peerSocketId)) {
               connectToPeer(peerSocketId);
             }
@@ -95,67 +87,118 @@ export default function HostRoom() {
       peerConnections.current[peerSocketId] = peer;
 
       peer.on('connect', () => {
-        toast.success('Direct connection established');
-        peerRetryCount.current[peerSocketId] = 0; // reset — this attempt succeeded
+        toast.success('Direct connection established', { id: 'peer-connected' });
+        peerRetryCount.current[peerSocketId] = 0;
+
+        // If we were waiting for this peer to connect so we could send files,
+        // now's the time. This handles the case where file-response arrived
+        // but the old peer was dead and we had to create a fresh one.
+        const pending = pendingSends.current[peerSocketId];
+        if (pending) {
+          delete pendingSends.current[peerSocketId];
+          doSendFiles(peer, peerSocketId, pending.files);
+        }
       });
 
       peer.on('error', (err) => {
         console.error('[peer error - HostRoom]', peerSocketId, err);
-        toast.error('Connection to a peer failed');
+        toast.error('Connection to a peer failed', { id: 'peer-error' });
       });
 
-      peer.on('iceStateChange', (state) => {
-        console.log('[ICE state - HostRoom]', peerSocketId, state);
+      peer.on('iceStateChange', (iceState) => {
+        console.log('[ICE state - HostRoom]', peerSocketId, iceState);
       });
 
       peer.on('close', () => {
         console.log('[peer close - HostRoom]', peerSocketId);
         delete peerConnections.current[peerSocketId];
+        delete pendingSends.current[peerSocketId];
       });
+
+      // Restore pending send if there was one
+      if (existingPending) {
+        pendingSends.current[peerSocketId] = existingPending;
+      }
 
       return peer;
     };
 
-    // Fires on the FIRST connection too, not just reconnects — we only act
-    // on subsequent ones (socket.io auto-reconnects after a drop).
+    // Extracted so it can be called both directly and from the connect handler
+    const doSendFiles = (peer, socketId, filesToSend) => {
+      toast.success('Sending files…', { id: 'sending-files' });
+      sendFiles({
+        peer,
+        files: filesToSend,
+        onProgress: (p) => setTransfers((t) => ({ ...t, [socketId]: p })),
+        onDone: () => {
+          toast.success('Transfer complete', { id: 'transfer-done' });
+          setTransfers((t) => ({ ...t, [socketId]: 1 }));
+          // Don't destroy here — the receiver will destroy its end, which
+          // closes our side too via the peer 'close' event. This avoids a
+          // double-destroy race and ensures clean state for the next batch.
+        },
+        onCancel: () => {
+          toast('Peer cancelled the download', { icon: '🛑', id: 'transfer-cancelled' });
+          setTransfers((t) => { const c = { ...t }; delete c[socketId]; return c; });
+        },
+        onError: (err) => {
+          console.error('[sendFiles onError - HostRoom]', socketId, err);
+          toast.error('Send failed — connection dropped', { id: 'send-failed' });
+          setTransfers((t) => { const c = { ...t }; delete c[socketId]; return c; });
+        },
+      });
+    };
+
+    // ---------- Socket handlers ----------
+
     const handleConnect = () => {
       if (!hasConnectedOnce.current) {
         hasConnectedOnce.current = true;
         return;
       }
-      if (!hostUserId.current) return; // can't resume without our stable id
+      if (!hostUserId.current) return;
+
+      setIsReconnecting(true);
 
       socket.emit('rejoin-room', { roomId, userId: hostUserId.current }, (res) => {
+        setIsReconnecting(false);
+
         if (!res?.ok) {
-          toast.error('This session could not be resumed');
+          toast.error('This session could not be resumed', { id: 'rejoin-fail' });
           navigate('/');
           return;
         }
-        toast.success('Back online');
+        toast.success('Back online', { id: 'rejoin-success' });
 
-        // The server's member list is the source of truth for who's still
-        // actually in the room. Add anyone we don't already know about (or
-        // don't already have a live connection object for) to our local
-        // state and re-establish WebRTC with them — this is what fixes the
-        // "peers.length is 0 / Send button disabled" bug after a host
-        // reconnect wiped local React state.
         if (Array.isArray(res.members)) {
-          setPeers((prev) => {
-            const known = new Set(prev.map((p) => p.socketId));
-            const additions = res.members.filter((m) => !known.has(m.socketId));
-            if (additions.length) {
-              // These peers joined while we were disconnected — the
-              // server's 'peer-joined' notification for them was sent to
-              // our old, already-dead socket id and lost. This is the only
-              // place we ever find out about them, so toast it here.
-              toast.success(
-                additions.length === 1 ? 'A device connected while you were away' : `${additions.length} devices connected while you were away`
-              );
+          const newSocketIds = new Set(res.members.map((m) => m.socketId));
+
+          // Destroy connections to peers that are no longer in the room
+          // (their sockets are dead — the server already filtered them out)
+          for (const oldSid of Object.keys(peerConnections.current)) {
+            if (!newSocketIds.has(oldSid)) {
+              peerConnections.current[oldSid]?.destroy();
+              delete peerConnections.current[oldSid];
+              delete peerRetryCount.current[oldSid];
+              delete pendingSends.current[oldSid];
             }
-            return additions.length ? [...prev, ...additions] : prev;
-          });
+          }
+
+          // REPLACE peers entirely — don't merge with stale entries.
+          // The server only returns live, connected members.
+          setPeers(res.members);
+
+          // Re-establish WebRTC with anyone we don't already have a live
+          // connection to (new peers, or peers whose connection died while
+          // we were disconnected).
           res.members.forEach((m) => {
-            if (!peerConnections.current[m.socketId]) {
+            if (!isPeerReady(peerConnections.current[m.socketId])) {
+              // Clean up dead connection if it exists
+              if (peerConnections.current[m.socketId]) {
+                peerConnections.current[m.socketId].destroy();
+                delete peerConnections.current[m.socketId];
+                delete peerRetryCount.current[m.socketId];
+              }
               connectToPeer(m.socketId);
             }
           });
@@ -164,29 +207,33 @@ export default function HostRoom() {
     };
     socket.on('connect', handleConnect);
 
-    // A PEER (not us) reconnected under a new socket id. Their old
-    // connection object, if any, is almost certainly dead — tear it down
-    // and start a fresh WebRTC handshake targeting their new socket id.
     socket.on('peer-reconnected', ({ userId, socketId }) => {
       const stalePeer = peersRef.current.find((p) => p.userId === userId);
       if (stalePeer && stalePeer.socketId !== socketId) {
         peerConnections.current[stalePeer.socketId]?.destroy();
         delete peerConnections.current[stalePeer.socketId];
+        delete peerRetryCount.current[stalePeer.socketId];
+        delete pendingSends.current[stalePeer.socketId];
       }
 
-      toast.success('A device reconnected');
+      toast.success('A device reconnected', { id: 'peer-reconnected' });
       setPeers((prev) => {
         const filtered = prev.filter((p) => p.userId !== userId);
         return [...filtered, { socketId, userId }];
       });
 
-      if (!peerConnections.current[socketId]) {
+      if (!isPeerReady(peerConnections.current[socketId])) {
+        if (peerConnections.current[socketId]) {
+          peerConnections.current[socketId].destroy();
+          delete peerConnections.current[socketId];
+          delete peerRetryCount.current[socketId];
+        }
         connectToPeer(socketId);
       }
     });
 
     socket.on('peer-joined', ({ peerSocketId, peerUserId }) => {
-      toast.success('A new device connected');
+      toast.success('A new device connected', { id: 'peer-joined' });
       setPeers((p) => [...p, { socketId: peerSocketId, userId: peerUserId }]);
       connectToPeer(peerSocketId);
     });
@@ -196,61 +243,60 @@ export default function HostRoom() {
     });
 
     socket.on('peer-left', ({ peerSocketId }) => {
-      toast('A peer left the session', { icon: '👋' });
+      toast('A peer left the session', { icon: '👋', id: 'peer-left' });
       setPeers((p) => p.filter((x) => x.socketId !== peerSocketId));
-      setTransfers((t) => {
-        const copy = { ...t };
-        delete copy[peerSocketId];
-        return copy;
-      });
+      setTransfers((t) => { const c = { ...t }; delete c[peerSocketId]; return c; });
       peerConnections.current[peerSocketId]?.destroy();
       delete peerConnections.current[peerSocketId];
+      delete peerRetryCount.current[peerSocketId];
+      delete pendingSends.current[peerSocketId];
     });
 
     socket.on('file-response', ({ fromSocketId, accept }) => {
       if (!accept) {
-        toast('A peer declined the transfer', { icon: 'ℹ️' });
+        toast('A peer declined the transfer', { icon: 'ℹ️', id: 'transfer-declined' });
         return;
       }
+
       const peer = peerConnections.current[fromSocketId];
-      if (!peer) {
-        toast.error('Lost connection to that peer');
+
+      // If the peer connection is dead or has no open data channel, we need
+      // to create a fresh one before we can send. This fixes the "2nd batch
+      // doesn't download" bug — the receiver destroyed its end after the
+      // 1st batch, so our data channel is closed even though our peer
+      // object still exists.
+      if (!isPeerReady(peer)) {
+        console.log('[file-response] peer not ready, recreating connection to', fromSocketId);
+
+        // Clean up the dead connection
+        if (peer) {
+          peer.destroy();
+          delete peerConnections.current[fromSocketId];
+          delete peerRetryCount.current[fromSocketId];
+        }
+
+        // Store the files to send — the connectToPeer's 'connect' handler
+        // will pick this up and call doSendFiles once the new connection is
+        // established.
+        pendingSends.current[fromSocketId] = { files: filesRef.current };
+        connectToPeer(fromSocketId);
         return;
       }
-      toast.success('Sending files...');
-      sendFiles({
-        peer,
-        files: filesRef.current,
-        onProgress: (p) => setTransfers((t) => ({ ...t, [fromSocketId]: p })),
-        onDone: () => {
-          toast.success('Transfer complete for one peer');
-          setTransfers((t) => ({ ...t, [fromSocketId]: 1 }));
-        },
-        onCancel: () => toast('Peer cancelled the download', { icon: '🛑' }),
-        onError: (err) => {
-          console.error('[sendFiles onError - HostRoom]', fromSocketId, err);
-          toast.error('Send failed — connection to that peer was not ready');
-          setTransfers((t) => {
-            const copy = { ...t };
-            delete copy[fromSocketId];
-            return copy;
-          });
-        },
-      });
+
+      doSendFiles(peer, fromSocketId, filesRef.current);
     });
 
     socket.on('room-closed', ({ reason }) => {
-      toast.error(reason === 'expired' ? 'Room expired' : 'Room closed');
+      toast.error(reason === 'expired' ? 'Room expired' : 'Room closed', { id: 'room-closed' });
       navigate('/');
     });
 
-    socket.on('connect_error', () => toast.error('Could not reach the server'));
+    socket.on('connect_error', () => {
+      toast.error('Could not reach the server', { id: 'connect-error' });
+    });
+
     socket.on('disconnect', () => {
-      // Don't alarm the user for a brief drop — 'connect' will fire
-      // 'Back online' automatically if/when it recovers. Only a real
-      // failure to resume (handled in handleConnect's rejoin-room callback)
-      // shows an error.
-      console.log('[socket disconnect - HostRoom] connection dropped, attempting to recover...');
+      console.log('[socket disconnect - HostRoom] connection dropped, will auto-recover…');
     });
 
     return () => {
@@ -275,9 +321,6 @@ export default function HostRoom() {
       size: file.size,
     }));
     setFiles(list);
-    // A fresh file selection means whatever is currently shown under
-    // "Transfers" (e.g. a previous round's 100% bars) no longer applies —
-    // clear it so the new round doesn't render mixed with stale progress.
     setTransfers({});
   };
 
@@ -285,32 +328,29 @@ export default function HostRoom() {
 
   const submitOffer = () => {
     if (!files.length) {
-      toast.error('Select at least one file first');
+      toast.error('Select at least one file first', { id: 'no-files' });
       return;
     }
     if (totalSize > 10 * 1024 * 1024 * 1024) {
-      toast.error('Total size exceeds the 10GB limit');
+      toast.error('Total size exceeds the 10GB limit', { id: 'too-large' });
       return;
     }
-    // Clear stale progress from a previous round before starting a new
-    // offer, so the Transfers panel doesn't show old and new rounds mixed
-    // together (e.g. a peer stuck at 100% from the last batch).
     setTransfers({});
     socket.emit('file-offer', {
       files: files.map((f) => ({ id: f.id, name: f.name, size: f.size })),
       totalSize,
     });
-    toast.success('Offer sent to connected peers');
+    toast.success('Offer sent to connected peers', { id: 'offer-sent' });
   };
 
   const terminateRoom = () => {
+    if (isReconnecting) {
+      toast.error('Still reconnecting — please wait', { id: 'reconnecting-terminate' });
+      return;
+    }
     socket.emit('terminate-room', null, (res) => {
       if (!res?.ok) {
-        // Previously this failed silently server-side with no feedback,
-        // leaving the room open and the peer still connected while the
-        // host's UI navigated away as if it had worked. Now we actually
-        // check and tell the user if it didn't work.
-        toast.error("Couldn't end the session — please try again");
+        toast.error("Couldn't end the session — please try again", { id: 'terminate-fail' });
         console.error('[terminateRoom] failed', res);
         return;
       }
@@ -320,9 +360,9 @@ export default function HostRoom() {
   };
 
   return (
-    <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
+    <div className="min-h-[calc(vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
 
-      {/* ── Top Bar: Identity, Timer, Terminate ── */}
+      {/* Top Bar */}
       <div className="navbar bg-base-100 rounded-2xl shadow-sm border border-base-300/50 px-4 sm:px-6 mb-6">
         <div className="flex-1 gap-3">
           <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
@@ -332,6 +372,11 @@ export default function HostRoom() {
             <p className="text-sm font-semibold leading-tight">Hosting Session</p>
             <p className="text-xs text-base-content/40 font-mono">{roomId}</p>
           </div>
+          {isReconnecting && (
+            <span className="badge badge-warning badge-sm gap-1">
+              <span className="loading loading-spinner loading-xs" /> Reconnecting…
+            </span>
+          )}
         </div>
 
         <div className="flex-none hidden sm:flex">
@@ -340,8 +385,9 @@ export default function HostRoom() {
 
         <div className="flex-none ml-4">
           <button
-            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error"
+            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error disabled:opacity-40"
             onClick={terminateRoom}
+            disabled={isReconnecting}
           >
             <Power size={15} />
             <span className="hidden sm:inline">End</span>
@@ -349,15 +395,15 @@ export default function HostRoom() {
         </div>
       </div>
 
-      {/* ── Mobile Timer (visible only on small screens) ── */}
+      {/* Mobile Timer */}
       <div className="sm:hidden mb-6">
         <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />
       </div>
 
-      {/* ── Bento Grid Layout ── */}
+      {/* Bento Grid */}
       <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
 
-        {/* ── Share Link Card (Spans full width on md, left side on lg) ── */}
+        {/* Share Link */}
         <div className="md:col-span-5 lg:col-span-4">
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
             <div className="card-body p-5 gap-4">
@@ -372,38 +418,29 @@ export default function HostRoom() {
           </div>
         </div>
 
-        {/* ── Stats Cluster (2 mini cards) ── */}
+        {/* Stats */}
         <div className="md:col-span-7 lg:col-span-4 grid grid-cols-2 gap-4 lg:gap-5">
-
-          {/* Connected Devices */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 items-center text-center gap-2">
               <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center mb-1">
                 <Users size={18} className="text-primary" />
               </div>
               <p className="text-3xl font-bold leading-none">{peers.length}</p>
-              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">
-                Connected
-              </p>
+              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">Connected</p>
             </div>
           </div>
-
-          {/* Payload Size */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 items-center text-center gap-2">
               <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center mb-1">
                 <HardDrive size={18} className="text-accent" />
               </div>
               <p className="text-2xl font-bold leading-none">{files.length ? formatBytes(totalSize) : '—'}</p>
-              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">
-                Payload
-              </p>
+              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">Payload</p>
             </div>
           </div>
-
         </div>
 
-        {/* ── Transfers Status (Right side) ── */}
+        {/* Transfers */}
         <div className="md:col-span-12 lg:col-span-4">
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
             <div className="card-body p-5 gap-3">
@@ -413,15 +450,10 @@ export default function HostRoom() {
                 </div>
                 <h2 className="card-title text-sm font-semibold">Transfers</h2>
               </div>
-
               {Object.entries(transfers).length > 0 ? (
                 <div className="space-y-3">
                   {Object.entries(transfers).map(([socketId, progress]) => (
-                    <TransferProgress
-                      key={socketId}
-                      label={`Peer ${socketId.slice(0, 6)}`}
-                      progress={progress}
-                    />
+                    <TransferProgress key={socketId} label={`Peer ${socketId.slice(0, 6)}`} progress={progress} />
                   ))}
                 </div>
               ) : (
@@ -437,11 +469,10 @@ export default function HostRoom() {
           </div>
         </div>
 
-        {/* ── File Upload Zone (Bottom Left - Spans large) ── */}
+        {/* File Upload */}
         <div className="md:col-span-8 lg:col-span-8">
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 gap-4">
-
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center">
@@ -455,27 +486,14 @@ export default function HostRoom() {
                   </span>
                 )}
               </div>
-
-              {/* Dropzone */}
               <label className="flex flex-col items-center justify-center w-full h-40 border-2 border-dashed rounded-xl border-base-300 bg-base-200/30 hover:bg-primary/5 hover:border-primary/40 cursor-pointer transition-all duration-200 group">
-                <input
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={onSelectFiles}
-                />
+                <input type="file" multiple className="hidden" onChange={onSelectFiles} />
                 <div className="w-12 h-12 rounded-xl bg-base-300/40 group-hover:bg-primary/10 flex items-center justify-center transition-colors duration-200 mb-3">
                   <Upload size={22} className="text-base-content/25 group-hover:text-primary transition-colors" />
                 </div>
-                <span className="text-sm font-medium text-base-content/50 group-hover:text-primary transition-colors">
-                  Click to browse
-                </span>
-                <span className="text-[11px] text-base-content/25 mt-1">
-                  Supports multiple files up to 10GB
-                </span>
+                <span className="text-sm font-medium text-base-content/50 group-hover:text-primary transition-colors">Click to browse</span>
+                <span className="text-[11px] text-base-content/25 mt-1">Supports multiple files up to 10GB</span>
               </label>
-
-              {/* File List */}
               {files.length > 0 && (
                 <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
                   {files.map((f) => (
@@ -487,39 +505,36 @@ export default function HostRoom() {
                   ))}
                 </div>
               )}
-
             </div>
           </div>
         </div>
 
-        {/* ── Send Action Card (Bottom Right) ── */}
+        {/* Send Action */}
         <div className="md:col-span-4 lg:col-span-4">
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
             <div className="card-body p-5 gap-4 justify-between">
-
               <div>
                 <h2 className="text-sm font-semibold mb-1">Ready to send?</h2>
                 <p className="text-xs text-base-content/40 leading-relaxed">
-                  {peers.length === 0
-                    ? 'Share the room link and wait for devices to connect.'
-                    : `${peers.length} device${peers.length > 1 ? 's are' : ' is'} waiting. ${files.length === 0 ? 'Add files to begin.' : 'Hit send to start.'}`
+                  {isReconnecting
+                    ? 'Reconnecting to the server…'
+                    : peers.length === 0
+                      ? 'Share the room link and wait for devices to connect.'
+                      : `${peers.length} device${peers.length > 1 ? 's are' : ' is'} waiting. ${files.length === 0 ? 'Add files to begin.' : 'Hit send to start.'}`
                   }
                 </p>
               </div>
-
               <button
                 className="btn btn-primary w-full gap-2"
                 onClick={submitOffer}
-                disabled={!files.length || !peers.length}
+                disabled={!files.length || !peers.length || isReconnecting}
               >
                 <Send size={16} />
                 Send to {peers.length || '—'}
               </button>
-
             </div>
           </div>
         </div>
-
       </div>
     </div>
   );

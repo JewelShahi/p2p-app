@@ -1,3 +1,4 @@
+// JoinRoom.jsx
 import { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
@@ -16,46 +17,153 @@ export default function JoinRoom() {
   const [offer, setOffer] = useState(null);
   const [progress, setProgress] = useState(null);
   const [downloadState, setDownloadState] = useState('idle'); // idle | downloading | complete
+  const [isReconnecting, setIsReconnecting] = useState(false);
+
   const hostPeer = useRef(null);
-  const hostRetryCount = useRef(0); // reset on success; used to know when to stop hoping and show a real error
+  const hostRetryCount = useRef(0);
   const downloadCallbacks = useRef(null);
   const hasReceivedData = useRef(false);
+  const isReceivingRef = useRef(false);      // guard against duplicate receiveFiles calls
+  const waitingForPeerRef = useRef(false);   // true after accept, waiting for fresh peer to connect
+  const pendingDownloadConfig = useRef(null); // { mode, fileHandles } — picked up by peer connect handler
+  const lastOfferIdRef = useRef(null);       // deduplicate file-offer events
 
-  // Keep a ref in sync with downloadState so event handlers created earlier
-  // (e.g. the peer 'close' listener) always read the CURRENT value instead
-  // of a stale value captured when the closure was first created.
   const downloadStateRef = useRef('idle');
-  useEffect(() => {
-    downloadStateRef.current = downloadState;
-  }, [downloadState]);
+  useEffect(() => { downloadStateRef.current = downloadState; }, [downloadState]);
 
-  // Stable identity used to resume the SAME room after a socket drop
-  // (backgrounded tab, phone lock, brief network blip) instead of being
-  // treated as a brand new join. Filled in once join-room's ack returns.
   const myUserId = useRef(sessionStorage.getItem(`peerUserId:${roomId}`) || null);
   const hasConnectedOnce = useRef(false);
 
   useEffect(() => {
     if (!socket.connected) socket.connect();
 
-    // Fires on the FIRST connection too, not just reconnects — only act on
-    // subsequent ones (socket.io auto-reconnects after a drop, e.g. briefly
-    // backgrounding the app to share the link).
+    // ---------- Helpers ----------
+
+    const clearDownloadState = () => {
+      if (downloadCallbacks.current?.stallTimer) {
+        clearTimeout(downloadCallbacks.current.stallTimer);
+        downloadCallbacks.current = null;
+      }
+      setDownloadState('idle');
+      setProgress(null);
+      hasReceivedData.current = false;
+      isReceivingRef.current = false;
+      waitingForPeerRef.current = false;
+      pendingDownloadConfig.current = null;
+    };
+
+    const handleDownloadComplete = () => {
+      if (downloadCallbacks.current?.stallTimer) {
+        clearTimeout(downloadCallbacks.current.stallTimer);
+        downloadCallbacks.current = null;
+      }
+      setProgress(1);
+      setDownloadState('complete');
+      hasReceivedData.current = false;
+      isReceivingRef.current = false;
+
+      // KEY FIX: Destroy the peer connection after each download completes.
+      // This prevents the "2nd batch doesn't download" bug — without this,
+      // the data channel retains stale listeners from the previous
+      // receiveFiles() call, causing duplicate onProgress callbacks,
+      // exponential toast spam, and eventually a frozen/broken download.
+      // The host's side will also close (peer 'close' event), and when
+      // the next batch's file-response arrives, it will recreate a fresh
+      // connection on both sides.
+      if (hostPeer.current) {
+        const oldPeer = hostPeer.current;
+        hostPeer.current = null;
+        oldPeer.destroy();
+      }
+    };
+
+    const startReceiveFiles = (mode, fileHandles) => {
+      if (!hostPeer.current) {
+        console.error('[startReceiveFiles] no peer — this should not happen');
+        clearDownloadState();
+        toast.error('Connection lost unexpectedly', { id: 'no-peer-receive' });
+        return;
+      }
+
+      const stallTimer = setTimeout(() => {
+        if (!hasReceivedData.current) {
+          console.error('[download stalled] no data within 30s');
+          toast.error('Download stalled — connection may have dropped', { id: 'download-stalled' });
+          clearDownloadState();
+        } else {
+          handleDownloadComplete();
+        }
+      }, 30000);
+
+      downloadCallbacks.current = { stallTimer };
+
+      console.log('[startReceiveFiles] peer.connected =', hostPeer.current.connected, '_channel =', !!hostPeer.current._channel);
+
+      receiveFiles({
+        peer: hostPeer.current,
+        mode,
+        fileHandles,
+        onProgress: (p) => {
+          hasReceivedData.current = true;
+          if (downloadCallbacks.current?.stallTimer) {
+            clearTimeout(downloadCallbacks.current.stallTimer);
+            downloadCallbacks.current.stallTimer = null;
+          }
+          setProgress(Math.min(Math.max(p, 0), 1));
+          if (p >= 1) handleDownloadComplete();
+        },
+        onDone: () => {
+          handleDownloadComplete();
+          toast.success('Download complete', { id: 'download-complete' });
+        },
+        onError: (err) => {
+          console.error('[receiveFiles onError]', err);
+          if (downloadStateRef.current === 'complete') return;
+          if (downloadCallbacks.current?.stallTimer) {
+            clearTimeout(downloadCallbacks.current.stallTimer);
+            downloadCallbacks.current = null;
+          }
+          isReceivingRef.current = false;
+          waitingForPeerRef.current = false;
+          if (hasReceivedData.current) {
+            handleDownloadComplete();
+            toast.success('Files received', { id: 'files-received-fallback' });
+          } else {
+            toast.error('Something interrupted the download', { id: 'download-error' });
+            setDownloadState('idle');
+            setProgress(null);
+          }
+        },
+      });
+    };
+
+    // ---------- Socket handlers ----------
+
     const handleConnect = () => {
       if (!hasConnectedOnce.current) {
         hasConnectedOnce.current = true;
         return;
       }
-      if (!myUserId.current) return; // can't resume without our stable id
+      if (!myUserId.current) return;
+
+      setIsReconnecting(true);
 
       socket.emit('rejoin-room', { roomId, userId: myUserId.current }, (res) => {
+        setIsReconnecting(false);
+
         if (!res?.ok) {
-          toast.error(res?.error === 'room-not-found' ? 'That room no longer exists' : 'Could not resume the session');
+          toast.error(res?.error === 'room-not-found' ? 'That room no longer exists' : 'Could not resume the session', { id: 'rejoin-fail' });
           navigate('/');
           return;
         }
-        toast.success('Back online');
-        if (res.currentOffer) setOffer(res.currentOffer);
+        toast.success('Back online', { id: 'rejoin-success' });
+        if (res.currentOffer) {
+          // Don't overwrite if we already have a newer offer
+          if (!lastOfferIdRef.current || res.currentOffer.offerId !== lastOfferIdRef.current) {
+            setOffer(res.currentOffer);
+            lastOfferIdRef.current = res.currentOffer.offerId;
+          }
+        }
         if (res.expiresAt) setExpiresAt(res.expiresAt);
       });
     };
@@ -63,15 +171,18 @@ export default function JoinRoom() {
 
     socket.emit('join-room', { roomId }, (res) => {
       if (!res?.ok) {
-        toast.error(res?.error === 'room-not-found' ? 'That room does not exist' : 'That room has expired');
+        toast.error(res?.error === 'room-not-found' ? 'That room does not exist' : 'That room has expired', { id: 'join-fail' });
         navigate('/');
         return;
       }
       myUserId.current = res.userId;
       sessionStorage.setItem(`peerUserId:${roomId}`, res.userId);
       setExpiresAt(res.expiresAt);
-      if (res.currentOffer) setOffer(res.currentOffer);
-      toast.success('Joined session');
+      if (res.currentOffer) {
+        setOffer(res.currentOffer);
+        lastOfferIdRef.current = res.currentOffer.offerId;
+      }
+      toast.success('Joined session', { id: 'join-success' });
     });
 
     socket.on('signal', ({ fromSocketId, signal }) => {
@@ -80,88 +191,104 @@ export default function JoinRoom() {
           initiator: false,
           socket,
           targetSocketId: fromSocketId,
-          onFailed: (state) => {
-            console.error('[peer onFailed - JoinRoom]', state);
-
+          onFailed: (failState) => {
+            console.error('[peer onFailed - JoinRoom]', failState);
             hostPeer.current?.destroy();
             hostPeer.current = null;
 
             const attempts = hostRetryCount.current + 1;
             hostRetryCount.current = attempts;
 
-            // This is the fix for "backgrounded briefly, comes back dead":
-            // the WebRTC connection (not necessarily the socket) often dies
-            // on a backgrounded mobile tab. We're not the initiator, so we
-            // don't rebuild it ourselves — the host detects its own side
-            // failing the same way and automatically re-initiates. We just
-            // need to clear the dead connection so the next 'signal' event
-            // builds a fresh one instead of erroring forever.
             if (attempts > 3) {
-              toast.error(`Connection to host ${state} — likely blocked by your network (try a different network or a TURN server)`);
+              toast.error(`Connection to host failed — try a different network`, { id: 'host-fail-final' });
               return;
             }
-            toast('Reconnecting to host…', { icon: '🔄' });
+            toast('Reconnecting to host…', { icon: '🔄', id: 'host-retrying' });
           },
         });
 
         hostPeer.current.on('connect', () => {
-          toast.success('Direct connection established');
+          toast.success('Direct connection established', { id: 'peer-connected' });
           hostRetryCount.current = 0;
+
+          // If we accepted a file offer and are waiting for the peer to
+          // connect so we can start receiving, now's the time.
+          if (waitingForPeerRef.current && pendingDownloadConfig.current) {
+            waitingForPeerRef.current = false;
+            const { mode, fileHandles } = pendingDownloadConfig.current;
+            pendingDownloadConfig.current = null;
+            startReceiveFiles(mode, fileHandles);
+          }
         });
 
         hostPeer.current.on('error', (err) => {
           console.error('[peer error - JoinRoom]', err);
-          toast.error('Connection to host failed');
+          toast.error('Connection to host failed', { id: 'peer-error' });
         });
 
-        hostPeer.current.on('iceStateChange', (state) => {
-          console.log('[ICE state - JoinRoom]', state);
+        hostPeer.current.on('iceStateChange', (iceState) => {
+          console.log('[ICE state - JoinRoom]', iceState);
         });
 
-        // Fallback: If peer closes during download, mark as complete.
-        // Uses downloadStateRef (not the closed-over downloadState) so this
-        // always checks the CURRENT state, not the state at connection time.
         hostPeer.current.on('close', () => {
           console.log('[peer close - JoinRoom]', {
             downloadState: downloadStateRef.current,
             hasReceivedData: hasReceivedData.current,
+            waitingForPeer: waitingForPeerRef.current,
           });
-          if (downloadStateRef.current === 'downloading' || hasReceivedData.current) {
+          // If we were in the middle of downloading, the host probably
+          // destroyed their end (normal after-send cleanup). Mark complete
+          // if we got any data at all.
+          if (downloadStateRef.current === 'downloading' && hasReceivedData.current) {
             handleDownloadComplete();
           }
+          hostPeer.current = null;
         });
       }
       hostPeer.current.signal(signal);
     });
 
     socket.on('peer-reconnected', ({ isHost }) => {
-      if (!isHost) return; // only the host reconnecting matters on this side
-      toast.success('Host reconnected');
+      if (!isHost) return;
+      toast.success('Host reconnected', { id: 'host-reconnected' });
       if (hostPeer.current) {
-        // The old connection is almost certainly dead after the host's
-        // socket dropped and came back under a new id. Destroy it and null
-        // it out so the next 'signal' event (which the host will send once
-        // it re-initiates) builds a fresh peer connection instead of trying
-        // to feed a new handshake into a stale, likely-closed one.
         hostPeer.current.destroy();
         hostPeer.current = null;
       }
     });
 
     socket.on('file-offer', (incomingOffer) => {
-      toast.success('The host wants to send you files');
+      // Deduplicate: if we already saw this exact offer (e.g. rejoin-room
+      // returned it AND the event also fired), skip the duplicate.
+      if (incomingOffer.offerId === lastOfferIdRef.current) return;
+      lastOfferIdRef.current = incomingOffer.offerId;
+
+      // FULL RESET for a fresh offer — this is critical for the 2nd/3rd
+      // batch fix. Without this, leftover state from the previous download
+      // (stall timers, receiving flags, etc.) bleeds into the new one and
+      // causes doubled toasts and frozen downloads.
+      clearDownloadState();
+
+      toast.success('The host wants to send you files', { id: 'file-offer-toast' });
       setOffer(incomingOffer);
     });
 
     socket.on('room-closed', ({ reason }) => {
-      toast.error(reason === 'expired' ? 'Room expired' : 'The host ended the session');
+      toast.error(reason === 'expired' ? 'Room expired' : 'The host ended the session', { id: 'room-closed' });
+      clearDownloadState();
       navigate('/');
     });
 
-    socket.on('connect_error', () => toast.error('Could not reach the server'));
-    socket.on('disconnect', () => {
-      console.log('[socket disconnect - JoinRoom] connection dropped, attempting to recover...');
+    socket.on('connect_error', () => {
+      toast.error('Could not reach the server', { id: 'connect-error' });
     });
+
+    socket.on('disconnect', () => {
+      console.log('[socket disconnect - JoinRoom] connection dropped, will auto-recover…');
+    });
+
+    // Expose handlers that the respond function needs
+    respondRef.current = { clearDownloadState, startReceiveFiles };
 
     return () => {
       socket.off('connect', handleConnect);
@@ -176,25 +303,18 @@ export default function JoinRoom() {
       }
       hostPeer.current?.destroy();
     };
-    // IMPORTANT: only depend on roomId. Including `navigate` here was
-    // causing this effect to re-run whenever the navigate function's
-    // reference changed, which destroyed the peer connection right after
-    // it connected — that's what caused "User-Initiated Abort, reason=Close
-    // called" immediately after a successful connection.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  const handleDownloadComplete = () => {
-    if (downloadCallbacks.current?.stallTimer) {
-      clearTimeout(downloadCallbacks.current.stallTimer);
-      downloadCallbacks.current.stallTimer = null;
-    }
-    setProgress(1);
-    setDownloadState('complete');
-    hasReceivedData.current = false;
-  };
+  // Ref to access effect-internal functions from respond()
+  const respondRef = useRef(null);
 
   const respond = async (accept, mode) => {
+    if (accept && isReceivingRef.current) {
+      toast('Download already in progress', { icon: '⚠️', id: 'already-receiving' });
+      return;
+    }
+
     let fileHandles = null;
 
     if (accept && mode === 'individual' && 'showSaveFilePicker' in window) {
@@ -205,94 +325,72 @@ export default function JoinRoom() {
           fileHandles.set(f.id, handle);
         }
       } catch (err) {
-        // Only a genuine user-initiated cancel (AbortError) should actually
-        // cancel the transfer. Any other failure here — the API being
-        // unsupported, or (very common on mobile) losing "trusted" user
-        // activation after the screen locked / tab went idle — should NOT
-        // kill the download. Instead, fall back to the in-memory Blob +
-        // <a download> path that receiveFiles() already supports when no
-        // file handle is provided.
         if (err?.name === 'AbortError') {
-          toast.error('No save location selected — download cancelled');
+          toast.error('No save location selected — download cancelled', { id: 'save-cancelled' });
           socket.emit('file-response', { accept: false, mode, offerId: offer.offerId });
           setOffer(null);
+          lastOfferIdRef.current = null;
           return;
         }
-        console.warn('[respond] showSaveFilePicker unavailable/failed, falling back to blob download', err);
+        console.warn('[respond] showSaveFilePicker unavailable, falling back to blob download', err);
         fileHandles = null;
       }
     }
 
     socket.emit('file-response', { accept, mode, offerId: offer.offerId });
     setOffer(null);
-    if (!accept || !hostPeer.current) return;
+    lastOfferIdRef.current = null;
 
+    if (!accept) return;
+
+    // Don't call receiveFiles directly — the peer connection was destroyed
+    // after the previous download (or might not exist yet). Instead, store
+    // the config and wait for the host to re-initiate WebRTC signaling,
+    // which will create a fresh peer. The peer's 'connect' handler (set up
+    // in the signal event) will pick this up and call startReceiveFiles.
+    isReceivingRef.current = true;
+    waitingForPeerRef.current = true;
+    pendingDownloadConfig.current = { mode, fileHandles };
     setDownloadState('downloading');
     setProgress(0);
     hasReceivedData.current = false;
 
+    // If by chance the peer is already connected (e.g. no previous download
+    // to destroy it, or host reconnected and we have a live connection), start
+    // immediately instead of waiting for a new signal.
+    if (hostPeer.current && hostPeer.current.connected && hostPeer.current._channel?.readyState === 'open') {
+      waitingForPeerRef.current = false;
+      const { mode: m, fileHandles: fh } = pendingDownloadConfig.current;
+      pendingDownloadConfig.current = null;
+      respondRef.current?.startReceiveFiles(m, fh);
+      return;
+    }
+
+    // Start a stall timer — if no peer connects within 30s, something's wrong
     const stallTimer = setTimeout(() => {
-      if (!hasReceivedData.current) {
-        console.error('[download stalled - JoinRoom] no data received within 30s');
-        toast.error('Download stalled — connection may have dropped');
+      if (waitingForPeerRef.current) {
+        console.error('[respond] timed out waiting for peer connection');
+        toast.error('Connection to host lost — waiting for reconnection…', { id: 'peer-timeout' });
+        isReceivingRef.current = false;
+        waitingForPeerRef.current = false;
+        pendingDownloadConfig.current = null;
         setDownloadState('idle');
         setProgress(null);
-      } else {
-        handleDownloadComplete();
       }
     }, 30000);
-
     downloadCallbacks.current = { stallTimer };
-
-    console.log('[respond] about to call receiveFiles, peer.connected =', hostPeer.current.connected, 'peer._channel exists =', !!hostPeer.current._channel);
-    receiveFiles({
-      peer: hostPeer.current,
-      mode,
-      fileHandles,
-      onProgress: (p) => {
-        hasReceivedData.current = true;
-        if (stallTimer) clearTimeout(stallTimer);
-        downloadCallbacks.current.stallTimer = null;
-
-        setProgress(Math.min(Math.max(p, 0), 1));
-
-        if (p >= 1) {
-          handleDownloadComplete();
-        }
-      },
-      onDone: () => {
-        handleDownloadComplete();
-        toast.success('Download complete');
-      },
-      onError: (err) => {
-        console.error('[receiveFiles onError - JoinRoom]', err);
-        if (downloadStateRef.current === 'complete') return; // already finished successfully — a later peer close/error is expected, not a failure
-        if (downloadCallbacks.current?.stallTimer) {
-          clearTimeout(downloadCallbacks.current.stallTimer);
-          downloadCallbacks.current.stallTimer = null;
-        }
-        if (hasReceivedData.current) {
-          handleDownloadComplete();
-          toast.success('Files received');
-        } else {
-          toast.error('Something interrupted the download');
-          setDownloadState('idle');
-          setProgress(null);
-        }
-      },
-    });
   };
 
   const leaveSession = () => {
     socket.emit('leave-room');
-    toast('You left the session', { icon: '👋' });
+    toast('You left the session', { icon: '👋', id: 'left-session' });
     navigate('/');
   };
 
   return (
     <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
 
-      {/* ── Top Bar ── */}
+      {/* Top Bar */}
       <div className="navbar bg-base-100 rounded-2xl shadow-sm border border-base-300/50 px-4 sm:px-6 mb-6">
         <div className="flex-1 gap-3">
           <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
@@ -302,6 +400,11 @@ export default function JoinRoom() {
             <p className="text-sm font-semibold leading-tight">Joined Session</p>
             <p className="text-xs text-base-content/40 font-mono">{roomId}</p>
           </div>
+          {isReconnecting && (
+            <span className="badge badge-warning badge-sm gap-1">
+              <span className="loading loading-spinner loading-xs" /> Reconnecting…
+            </span>
+          )}
         </div>
 
         <div className="flex-none hidden sm:flex">
@@ -310,8 +413,9 @@ export default function JoinRoom() {
 
         <div className="flex-none ml-4">
           <button
-            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error"
+            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error disabled:opacity-40"
             onClick={leaveSession}
+            disabled={isReconnecting}
           >
             <LogOut size={15} />
             <span className="hidden sm:inline">Leave</span>
@@ -319,40 +423,32 @@ export default function JoinRoom() {
         </div>
       </div>
 
-      {/* ── Mobile Timer ── */}
+      {/* Mobile Timer */}
       <div className="sm:hidden mb-6">
         {expiresAt && <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />}
       </div>
 
-      {/* ── Bento Grid Layout ── */}
+      {/* Bento Grid */}
       <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
 
-        {/* ── Main Status Area (Left / Large) ── */}
+        {/* Main Status */}
         <div className="md:col-span-8">
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
             <div className="card-body p-5 gap-4">
               <div className="flex items-center gap-3">
                 <div className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors duration-300 ${
-                  downloadState === 'complete'
-                    ? 'bg-success/10'
-                    : downloadState === 'downloading'
-                      ? 'bg-primary/10'
-                      : 'bg-base-200/70'
+                  downloadState === 'complete' ? 'bg-success/10'
+                    : downloadState === 'downloading' ? 'bg-primary/10'
+                    : 'bg-base-200/70'
                 }`}>
-                  {downloadState === 'complete' ? (
-                    <CheckCircle2 size={16} className="text-success" />
-                  ) : downloadState === 'downloading' ? (
-                    <ArrowDownToLine size={16} className="text-primary" />
-                  ) : (
-                    <Wifi size={16} className="text-base-content/30" />
-                  )}
+                  {downloadState === 'complete' ? <CheckCircle2 size={16} className="text-success" />
+                    : downloadState === 'downloading' ? <ArrowDownToLine size={16} className="text-primary" />
+                    : <Wifi size={16} className="text-base-content/30" />}
                 </div>
                 <h2 className="card-title text-sm font-semibold">
-                  {downloadState === 'complete'
-                    ? 'Downloaded'
-                    : downloadState === 'downloading'
-                      ? 'Receiving Files'
-                      : 'Waiting for Host'}
+                  {downloadState === 'complete' ? 'Downloaded'
+                    : downloadState === 'downloading' ? 'Receiving Files'
+                    : 'Waiting for Host'}
                 </h2>
                 {downloadState === 'downloading' && (
                   <span className="badge badge-primary badge-sm font-mono ml-auto">
@@ -381,7 +477,7 @@ export default function JoinRoom() {
                   </div>
                   <p className="text-lg font-semibold text-base-content/80">Files Downloaded</p>
                   <p className="text-xs text-base-content/30 mt-1.5 max-w-xs">
-                    The host can send more files if needed — this card will update automatically.
+                    The host can send more files — a new offer will appear automatically.
                   </p>
                 </div>
               )}
@@ -401,10 +497,10 @@ export default function JoinRoom() {
           </div>
         </div>
 
-        {/* ── Side Panel (Right / Small) ── */}
+        {/* Side Panel */}
         <div className="md:col-span-4 flex flex-col gap-4 lg:gap-5">
 
-          {/* Session Info Card */}
+          {/* Session Info */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 gap-4">
               <div className="flex items-center gap-3">
@@ -413,16 +509,13 @@ export default function JoinRoom() {
                 </div>
                 <h2 className="card-title text-sm font-semibold">Session</h2>
               </div>
-
               <div className="space-y-3">
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-base-content/40">Status</span>
                   <span className={`badge badge-sm gap-1 ${
-                    downloadState === 'downloading'
-                      ? 'badge-primary'
-                      : downloadState === 'complete'
-                        ? 'badge-success'
-                        : 'badge-success'
+                    downloadState === 'downloading' ? 'badge-primary'
+                      : downloadState === 'complete' ? 'badge-success'
+                      : 'badge-success'
                   }`}>
                     {downloadState === 'downloading' ? 'Transferring' : 'Connected'}
                   </span>
@@ -439,7 +532,7 @@ export default function JoinRoom() {
             </div>
           </div>
 
-          {/* Leave Action Card */}
+          {/* Leave */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50 flex-1">
             <div className="card-body p-5 justify-center gap-4">
               <div>
@@ -449,21 +542,19 @@ export default function JoinRoom() {
                 </p>
               </div>
               <button
-                className="btn btn-error btn-outline w-full gap-2"
+                className="btn btn-error btn-outline w-full gap-2 disabled:opacity-40"
                 onClick={leaveSession}
+                disabled={isReconnecting}
               >
                 <LogOut size={16} />
                 Leave Session
               </button>
             </div>
           </div>
-
         </div>
       </div>
 
-      {/* ── Modal Trigger (Rendered outside grid) ── */}
       <FileOfferModal offer={offer} onRespond={respond} />
-
     </div>
   );
 }
