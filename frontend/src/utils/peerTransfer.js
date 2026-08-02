@@ -1,13 +1,11 @@
 import SimplePeer from 'simple-peer';
 
 const CHUNK_SIZE = 16 * 1024;
-const BACKPRESSURE_LIMIT = 4 * 1024 * 1024;
+const BACKPRESSURE_LIMIT = 1 * 1024 * 1024; // lowered from 4MB — large buffers were likely overwhelming the channel
 
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  // Free public TURN for testing — openrelay.metered.ca. Swap for your own
-  // coturn server before production; free relays are rate-limited/unreliable.
   {
     urls: 'turn:openrelay.metered.ca:80',
     username: 'openrelayproject',
@@ -30,12 +28,6 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
     socket.emit('signal', { targetSocketId, signal });
   });
 
-  // simple-peer doesn't always surface ICE failure as an 'error' event —
-  // watch the underlying RTCPeerConnection directly so a dead connection
-  // doesn't just sit silently at 0% forever.
-  // NOTE: 'disconnected' is often transient (brief packet loss, wifi hiccup,
-  // NAT re-negotiation) and frequently self-recovers back to 'connected'.
-  // Only treat it as fatal if it hasn't recovered after a grace period.
   let disconnectTimer = null;
 
   peer._pc?.addEventListener?.('iceconnectionstatechange', () => {
@@ -65,7 +57,7 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
         if (current === 'disconnected' || current === 'failed') {
           onFailed?.(current);
         }
-      }, 5000); // grace period — adjust if needed
+      }, 5000);
     }
   });
 
@@ -76,6 +68,8 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
   const totalSize = files.reduce((s, f) => s + f.size, 0);
   let sentTotal = 0;
   let cancelled = false;
+
+  console.log('[sendFiles] starting', { fileCount: files.length, totalSize, peerConnected: peer.connected });
 
   const dataHandler = (data) => {
     if (typeof data === 'string') {
@@ -90,8 +84,15 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 
   const waitForConnect = () =>
     new Promise((resolve) => {
-      if (peer.connected) return resolve();
-      peer.once('connect', resolve);
+      if (peer.connected) {
+        console.log('[sendFiles] peer already connected');
+        return resolve();
+      }
+      console.log('[sendFiles] waiting for peer to connect...');
+      peer.once('connect', () => {
+        console.log('[sendFiles] peer connected event fired');
+        resolve();
+      });
     });
 
   (async () => {
@@ -100,31 +101,42 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 
       for (const f of files) {
         if (cancelled) break;
+        console.log('[sendFiles] starting file', f.name, f.size);
         peer.send(JSON.stringify({ type: 'file-start', id: f.id, name: f.name, size: f.size }));
 
         const reader = f.file.stream().getReader();
+        let chunkCount = 0;
         while (true) {
           if (cancelled) break;
           const { done, value } = await reader.read();
           if (done) break;
           for (let o = 0; o < value.byteLength; o += CHUNK_SIZE) {
             if (cancelled) break;
-            const slice = value.subarray(o, o + CHUNK_SIZE);
-            peer.send(slice);
-            sentTotal += slice.byteLength;
-            onProgress?.(Math.min(sentTotal / totalSize, 1));
+
+            // Wait for buffer to drain BEFORE sending, not just after —
+            // sending while already over the limit can pile up faster
+            // than the channel drains, especially on slower/lossy links.
             while (peer._channel && peer._channel.bufferedAmount > BACKPRESSURE_LIMIT) {
               await new Promise((r) => setTimeout(r, 50));
             }
+
+            const slice = value.slice(o, o + CHUNK_SIZE); // .slice() copies, .subarray() was a view — copy is safer across async boundaries
+            peer.send(slice);
+            sentTotal += slice.byteLength;
+            chunkCount++;
+            onProgress?.(Math.min(sentTotal / totalSize, 1));
           }
         }
+        console.log('[sendFiles] finished file', f.name, 'chunks sent:', chunkCount);
         if (!cancelled) peer.send(JSON.stringify({ type: 'file-end', id: f.id }));
       }
       if (!cancelled) {
         peer.send(JSON.stringify({ type: 'transfer-complete' }));
+        console.log('[sendFiles] transfer-complete sent, total bytes:', sentTotal);
         onDone?.();
       }
     } catch (err) {
+      console.error('[sendFiles] error', err);
       onError?.(err);
     } finally {
       peer.off('data', dataHandler);
@@ -139,11 +151,12 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   let totalExpected = 0;
   const zipParts = [];
 
-  // Serialize all writes so out-of-order/overlapping async writes can't
-  // scramble the file — each chunk waits for the previous one to finish.
+  console.log('[receiveFiles] listening, peer connected:', peer.connected);
+
   let writeQueue = Promise.resolve();
   const enqueue = (task) => {
     writeQueue = writeQueue.then(task).catch((err) => {
+      console.error('[receiveFiles] write error', err);
       onError?.('write-error');
       throw err;
     });
@@ -154,6 +167,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
     enqueue(async () => {
       if (typeof data === 'string') {
         const msg = JSON.parse(data);
+        console.log('[receiveFiles] control message', msg.type);
 
         if (msg.type === 'file-start') {
           currentMeta = msg;
@@ -181,6 +195,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
         }
 
         if (msg.type === 'transfer-complete') {
+          console.log('[receiveFiles] transfer-complete received, total bytes:', received);
           if (mode === 'zip') {
             const JSZip = (await import('jszip')).default;
             const zip = new JSZip();
@@ -201,12 +216,16 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   });
 
   peer.on('close', () => {
+    console.log('[receiveFiles] peer closed, bytes received so far:', received);
     enqueue(async () => {
       if (writer?.abort) await writer.abort();
       onError?.('connection-lost');
     });
   });
-  peer.on('error', () => onError?.('connection-error'));
+  peer.on('error', (err) => {
+    console.error('[receiveFiles] peer error', err);
+    onError?.('connection-error');
+  });
 }
 
 function triggerDownload(blob, name) {
