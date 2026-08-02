@@ -133,11 +133,22 @@ export default function JoinRoom() {
           const handle = await window.showSaveFilePicker({ suggestedName: f.name });
           fileHandles.set(f.id, handle);
         }
-      } catch {
-        toast.error('No save location selected — download cancelled');
-        socket.emit('file-response', { accept: false, mode, offerId: offer.offerId });
-        setOffer(null);
-        return;
+      } catch (err) {
+        // Only a genuine user-initiated cancel (AbortError) should actually
+        // cancel the transfer. Any other failure here — the API being
+        // unsupported, or (very common on mobile) losing "trusted" user
+        // activation after the screen locked / tab went idle — should NOT
+        // kill the download. Instead, fall back to the in-memory Blob +
+        // <a download> path that receiveFiles() already supports when no
+        // file handle is provided.
+        if (err?.name === 'AbortError') {
+          toast.error('No save location selected — download cancelled');
+          socket.emit('file-response', { accept: false, mode, offerId: offer.offerId });
+          setOffer(null);
+          return;
+        }
+        console.warn('[respond] showSaveFilePicker unavailable/failed, falling back to blob download', err);
+        fileHandles = null;
       }
     }
 
@@ -249,13 +260,12 @@ export default function JoinRoom() {
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
             <div className="card-body p-5 gap-4">
               <div className="flex items-center gap-3">
-                <div className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors duration-300 ${
-                  downloadState === 'complete'
+                <div className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors duration-300 ${downloadState === 'complete'
                     ? 'bg-success/10'
                     : downloadState === 'downloading'
                       ? 'bg-primary/10'
                       : 'bg-base-200/70'
-                }`}>
+                  }`}>
                   {downloadState === 'complete' ? (
                     <CheckCircle2 size={16} className="text-success" />
                   ) : downloadState === 'downloading' ? (
@@ -334,13 +344,12 @@ export default function JoinRoom() {
               <div className="space-y-3">
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-base-content/40">Status</span>
-                  <span className={`badge badge-sm gap-1 ${
-                    downloadState === 'downloading'
+                  <span className={`badge badge-sm gap-1 ${downloadState === 'downloading'
                       ? 'badge-primary'
                       : downloadState === 'complete'
                         ? 'badge-success'
                         : 'badge-success'
-                  }`}>
+                    }`}>
                     {downloadState === 'downloading' ? 'Transferring' : 'Connected'}
                   </span>
                 </div>
