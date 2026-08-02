@@ -156,7 +156,10 @@ export function registerSignaling(io, roomManager) {
     socket.on('file-offer', (payload) => {
       const roomId = socket.data.roomId;
       const room = roomManager.getRoom(roomId);
-      if (!room || room.hostSocketId !== socket.id) return; // only host can offer
+      // Identify the host by stable userId, not the live hostSocketId — the
+      // latter can be momentarily out of sync right after a reconnect and
+      // would silently reject a legitimate host action with no feedback.
+      if (!room || socket.data.userId !== room.hostUserId) return;
 
       const totalSize = payload?.totalSize || 0;
       if (totalSize > MAX_UPLOAD_BYTES) {
@@ -212,10 +215,21 @@ export function registerSignaling(io, roomManager) {
 
     // ---------- HOST TERMINATES ROOM ----------
     // Explicit, intentional action — always closes immediately, no grace period.
-    socket.on('terminate-room', () => {
+    // Now acknowledges success/failure — previously this failed silently if
+    // the host's live socket id was even momentarily out of sync (e.g. right
+    // after a reconnect), leaving the room open with no indication to the host.
+    socket.on('terminate-room', (payload, ack) => {
       const room = roomManager.getRoom(socket.data.roomId);
-      if (!room || room.hostSocketId !== socket.id) return;
+      if (!room) {
+        ack?.({ ok: false, error: 'room-not-found' });
+        return;
+      }
+      if (socket.data.userId !== room.hostUserId) {
+        ack?.({ ok: false, error: 'not-host' });
+        return;
+      }
       roomManager.closeRoom(room.id, 'terminated');
+      ack?.({ ok: true });
     });
 
     // ---------- LEAVE ----------

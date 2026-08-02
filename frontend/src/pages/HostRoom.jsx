@@ -114,6 +114,15 @@ export default function HostRoom() {
           setPeers((prev) => {
             const known = new Set(prev.map((p) => p.socketId));
             const additions = res.members.filter((m) => !known.has(m.socketId));
+            if (additions.length) {
+              // These peers joined while we were disconnected — the
+              // server's 'peer-joined' notification for them was sent to
+              // our old, already-dead socket id and lost. This is the only
+              // place we ever find out about them, so toast it here.
+              toast.success(
+                additions.length === 1 ? 'A device connected while you were away' : `${additions.length} devices connected while you were away`
+              );
+            }
             return additions.length ? [...prev, ...additions] : prev;
           });
           res.members.forEach((m) => {
@@ -207,7 +216,13 @@ export default function HostRoom() {
     });
 
     socket.on('connect_error', () => toast.error('Could not reach the server'));
-    socket.on('disconnect', () => toast.error('Disconnected from server'));
+    socket.on('disconnect', () => {
+      // Don't alarm the user for a brief drop — 'connect' will fire
+      // 'Back online' automatically if/when it recovers. Only a real
+      // failure to resume (handled in handleConnect's rejoin-room callback)
+      // shows an error.
+      console.log('[socket disconnect - HostRoom] connection dropped, attempting to recover...');
+    });
 
     return () => {
       socket.off('connect', handleConnect);
@@ -260,9 +275,19 @@ export default function HostRoom() {
   };
 
   const terminateRoom = () => {
-    socket.emit('terminate-room');
-    Object.values(peerConnections.current).forEach((p) => cancelTransfer(p));
-    navigate('/');
+    socket.emit('terminate-room', null, (res) => {
+      if (!res?.ok) {
+        // Previously this failed silently server-side with no feedback,
+        // leaving the room open and the peer still connected while the
+        // host's UI navigated away as if it had worked. Now we actually
+        // check and tell the user if it didn't work.
+        toast.error("Couldn't end the session — please try again");
+        console.error('[terminateRoom] failed', res);
+        return;
+      }
+      Object.values(peerConnections.current).forEach((p) => cancelTransfer(p));
+      navigate('/');
+    });
   };
 
   return (

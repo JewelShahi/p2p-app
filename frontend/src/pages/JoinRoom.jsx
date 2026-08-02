@@ -137,7 +137,9 @@ export default function JoinRoom() {
     });
 
     socket.on('connect_error', () => toast.error('Could not reach the server'));
-    socket.on('disconnect', () => toast.error('Disconnected from server'));
+    socket.on('disconnect', () => {
+      console.log('[socket disconnect - JoinRoom] connection dropped, attempting to recover...');
+    });
 
     return () => {
       socket.off('connect', handleConnect);
