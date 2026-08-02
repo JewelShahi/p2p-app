@@ -132,7 +132,16 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
       }
       if (!cancelled) {
         peer.send(JSON.stringify({ type: 'transfer-complete' }));
-        console.log('[sendFiles] transfer-complete sent, total bytes:', sentTotal);
+
+        // Wait until the data channel has ACTUALLY flushed everything —
+        // not just queued it — before telling the UI "done". Otherwise
+        // closing/navigating right after can drop still-buffered bytes,
+        // silently corrupting the file on the receiver's end.
+        while (peer._channel && peer._channel.bufferedAmount > 0) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+
+        console.log('[sendFiles] fully flushed, total bytes:', sentTotal);
         onDone?.();
       }
     } catch (err) {
