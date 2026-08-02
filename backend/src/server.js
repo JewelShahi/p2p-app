@@ -24,7 +24,15 @@ app.set('trust proxy', 1);
 
 // 2. Prevent accidental '*' wildcard CORS fallbacks in production environments
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN;
-const safeOrigin = CLIENT_ORIGIN || 'http://localhost:3000'; // Default to local dev URL only
+const allowedOrigin = (origin, callback) => {
+  if (!origin || origin.endsWith(".vercel.app") || origin === "http://localhost:3000") {
+    callback(null, true);
+  } else {
+    callback(new Error("Not allowed by CORS"));
+  }
+};
+
+app.use(cors({ origin: allowedOrigin, credentials: true }));
 
 app.use(
   helmet({
@@ -33,7 +41,7 @@ app.use(
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
-app.use(cors({ origin: safeOrigin }));
+
 app.use(express.json());
 
 const server = http.createServer(app);
