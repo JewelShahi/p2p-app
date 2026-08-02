@@ -162,6 +162,7 @@ export default function JoinRoom() {
 
     downloadCallbacks.current = { stallTimer };
 
+    console.log('[respond] about to call receiveFiles, peer.connected =', hostPeer.current.connected, 'peer._channel exists =', !!hostPeer.current._channel);
     receiveFiles({
       peer: hostPeer.current,
       mode,
