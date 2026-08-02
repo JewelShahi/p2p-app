@@ -20,6 +20,10 @@ export default function HostRoom() {
   const [transfers, setTransfers] = useState({});
 
   const peerConnections = useRef({});
+  const filesRef = useRef([]);
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
 
   useEffect(() => {
     if (!socket.connected) socket.connect();
@@ -86,7 +90,7 @@ export default function HostRoom() {
       toast.success('Sending files...');
       sendFiles({
         peer,
-        files,
+        files: filesRef.current,
         onProgress: (p) => setTransfers((t) => ({ ...t, [fromSocketId]: p })),
         onDone: () => {
           toast.success('Transfer complete for one peer');
@@ -123,7 +127,7 @@ export default function HostRoom() {
       socket.off('disconnect');
       Object.values(peerConnections.current).forEach((p) => p.destroy());
     };
-  }, [files, navigate]);
+  }, []);
 
   const onSelectFiles = (e) => {
     const list = Array.from(e.target.files).map((file) => ({
