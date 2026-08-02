@@ -23,6 +23,7 @@
     "socket.io": "^4.8.3",
     "uuid": "^14.0.1",
     "webtorrent": "^3.0.21",
+    "ws": "^8.21.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

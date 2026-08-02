@@ -3,11 +3,13 @@ import cors from 'cors';
 import helmet from 'helmet';
 import http from 'http';
 import { Server } from 'socket.io';
+import { WebSocketServer } from 'ws'; // NEW: Raw WebSocket for torrent streaming
 
 import { RoomManager } from './utils/roomManager.js';
 import { registerSignaling } from './utils/signaling.js';
 import routes from './routes/routes.js';
 import torrentRoutes from './routes/torrent.route.js';
+import { handleWsTorrentUpgrade } from './controllers/ws-torrent.controller.js'; // NEW: WS handler
 import errorHandler from './middlewares/errorHandler.middleware.js';
 import { apiLimiter } from './middlewares/rateLimiter.middleware.js';
 import dotenv from 'dotenv';
@@ -79,6 +81,19 @@ app.get('/', (req, res) => {
 
 // Must be registered after all routes
 app.use(errorHandler);
+
+// ====================================================================================
+// NEW: WEBSOCKET STREAMING FOR TORRENTS (DOES NOT INTERFERE WITH SOCKET.IO/P2P)
+// ====================================================================================
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  // Only intercept the exact path our React app will call.
+  // Socket.io handles its own paths automatically, so we ignore everything else.
+  if (req.url === '/ws-download') {
+    handleWsTorrentUpgrade(wss, req, socket, head);
+  }
+});
+// ====================================================================================
 
 server.listen(PORT, () => {
   console.log(`P2P share backend listening on port ${PORT}`);

@@ -4,7 +4,7 @@ import toast from 'react-hot-toast';
 import {
   Download, FolderArchive, ArrowLeft, Hash, Shield, Server,
   File, FileText, Film, Music, Image, Archive, Disc,
-  Settings, MessageSquare, FileCode, HardDrive
+  Settings, MessageSquare, FileCode, HardDrive, FolderOpen
 } from 'lucide-react';
 import api from '../api/axios';
 import { API_URL } from '../constants/config';
@@ -65,8 +65,10 @@ export default function TorrentDownload() {
     return (
       <div className="min-h-[calc(100vh-4rem)] flex items-center justify-center">
         <div className="flex flex-col items-center gap-4">
-          <span className="loading loading-spinner loading-lg text-primary" />
-          <p className="text-sm text-base-content/40 font-medium">Resolving torrent metadata...</p>
+          <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center">
+            <span className="loading loading-spinner loading-lg text-primary" />
+          </div>
+          <p className="text-sm text-base-content/40 font-medium">Resolving torrent metadata…</p>
         </div>
       </div>
     );
@@ -80,10 +82,10 @@ export default function TorrentDownload() {
             <FolderArchive size={20} className="text-error" />
           </div>
           <p className="text-sm font-semibold mb-3">Could not resolve that link</p>
-          <div className="bg-error/5 rounded-lg p-3 mb-4">
+          <div className="bg-error/5 rounded-lg p-3 mb-5">
             <p className="text-xs text-error/70 font-mono break-words leading-relaxed">{error}</p>
           </div>
-          <button onClick={() => navigate('/')} className="btn btn-ghost btn-sm">Return Home</button>
+          <button onClick={() => navigate('/')} className="btn btn-primary btn-sm">Return Home</button>
         </div>
       </div>
     );
@@ -94,100 +96,141 @@ export default function TorrentDownload() {
   const isSingleFile = info.files.length === 1;
 
   return (
-    <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-5xl mx-auto flex flex-col">
+    <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
 
-      {/* ── Header ── */}
-      <div className="flex items-center gap-3 mb-6">
-        <button onClick={() => navigate('/')} className="btn btn-ghost btn-sm btn-square shrink-0">
-          <ArrowLeft size={16} />
-        </button>
-        <div className="min-w-0 flex-1">
-          <h1 className="text-base sm:text-lg font-bold truncate leading-tight">{info.name}</h1>
+      {/* ── Top Bar ── */}
+      <div className="navbar bg-base-100 rounded-2xl shadow-sm border border-base-300/50 px-4 sm:px-6 mb-6">
+        <div className="flex-1 flex gap-3">
+          <button onClick={() => navigate('/')} className="btn btn-ghost btn-sm btn-square shrink-0">
+            <ArrowLeft size={16} />
+          </button>
+          <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
+            <FolderArchive size={18} className="text-primary" />
+          </div>
+          <p className="text-sm text-center font-semibold leading-tight">Torrent Download</p>
         </div>
+
       </div>
 
-      {/* ── Stats + Download Row ── */}
-      <div className="flex flex-wrap items-stretch gap-2.5 mb-5">
-        <div className="flex items-center gap-2.5 bg-base-100 border border-base-300/50 rounded-xl px-4 py-2.5 flex-1 min-w-[130px]">
-          <HardDrive size={15} className="text-primary/50 shrink-0" />
-          <div className="min-w-0">
-            <p className="text-[10px] text-base-content/35 uppercase tracking-wider leading-none mb-0.5">Size</p>
-            <p className="text-sm font-bold leading-tight">{formatBytes(info.totalSize)}</p>
-          </div>
-        </div>
+      {/* ── Bento Grid ── */}
+      <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
 
-        <div className="flex items-center gap-2.5 bg-base-100 border border-base-300/50 rounded-xl px-4 py-2.5 flex-1 min-w-[110px]">
-          <FolderArchive size={15} className="text-primary/50 shrink-0" />
-          <div className="min-w-0">
-            <p className="text-[10px] text-base-content/35 uppercase tracking-wider leading-none mb-0.5">Files</p>
-            <p className="text-sm font-bold leading-tight">{info.files.length}</p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2.5 bg-base-100 border border-base-300/50 rounded-xl px-4 py-2.5 flex-[2] min-w-[220px]">
-          <Hash size={15} className="text-primary/50 shrink-0" />
-          <div className="min-w-0 flex-1">
-            <p className="text-[10px] text-base-content/35 uppercase tracking-wider leading-none mb-0.5">Info Hash</p>
-            <p className="text-xs font-mono text-base-content/50 truncate leading-tight">{info.infoHash}</p>
-          </div>
-        </div>
-
-        <button
-          className="btn btn-primary gap-2 shrink-0 w-full sm:w-auto"
-          onClick={() => downloadFile(isSingleFile ? info.files[0].index : undefined)}
-        >
-          <Download size={15} />
-          {isSingleFile ? 'Download' : 'Download All'}
-        </button>
-      </div>
-
-      {/* ── File List ── */}
-      <div className="bg-base-100 border border-base-300/50 rounded-xl overflow-hidden flex-1 flex flex-col mb-5">
-        <div className="px-5 py-2.5 border-b border-base-300/40 bg-base-200/20">
-          <h2 className="text-xs font-semibold text-base-content/50 uppercase tracking-wider">Included Files</h2>
-        </div>
-        <div className="divide-y divide-base-300/25 overflow-y-auto max-h-[52vh]">
-          {info.files.map((f) => {
-            const Icon = getFileIcon(f.name);
-            return (
-              <div
-                key={f.index}
-                className="flex items-center gap-3 px-5 py-2.5 hover:bg-primary/[0.03] group transition-colors"
-              >
-                <div className="w-8 h-8 rounded-lg bg-base-200/60 flex items-center justify-center shrink-0">
-                  <Icon size={15} className="text-base-content/35" />
-                </div>
-                <span className="text-sm truncate flex-1 text-base-content/75 group-hover:text-base-content transition-colors">{f.name}</span>
-                <span className="text-xs font-mono text-base-content/30 shrink-0 tabular-nums">{formatBytes(f.size)}</span>
-                {info.files.length > 1 && (
-                  <button
-                    className="btn btn-ghost btn-xs btn-circle shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-base-content/30 hover:text-primary"
-                    onClick={() => downloadFile(f.index)}
-                    title="Download this file"
-                  >
-                    <Download size={12} />
-                  </button>
-                )}
+        {/* Size Stat */}
+        <div className="md:col-span-4">
+          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
+            <div className="card-body p-5 items-center text-center gap-2">
+              <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center mb-1">
+                <HardDrive size={18} className="text-primary" />
               </div>
-            );
-          })}
+              <p className="text-3xl font-bold leading-none">{formatBytes(info.totalSize)}</p>
+              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">Size</p>
+            </div>
+          </div>
         </div>
-      </div>
 
-      {/* ── Footer ── */}
-      <div className="flex items-center justify-center gap-5 sm:gap-7 text-[11px] text-base-content/20 pb-2">
-        <div className="flex items-center gap-1.5">
-          <Server size={11} />
-          <span>WebTorrent</span>
+        {/* Files Stat */}
+        <div className="md:col-span-4">
+          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
+            <div className="card-body p-5 items-center text-center gap-2">
+              <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center mb-1">
+                <FolderOpen size={18} className="text-accent" />
+              </div>
+              <p className="text-3xl font-bold leading-none">{info.files.length}</p>
+              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">Files</p>
+            </div>
+          </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          <Shield size={11} />
-          <span>No tracking</span>
+
+        {/* Info Hash */}
+        <div className="md:col-span-4">
+          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
+            <div className="card-body p-5 gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-secondary/10 flex items-center justify-center">
+                  <Hash size={16} className="text-secondary" />
+                </div>
+                <h2 className="card-title text-sm font-semibold">Info Hash</h2>
+              </div>
+              <div className="bg-base-200/40 rounded-lg px-3 py-2.5">
+                <p className="text-xs text-base-content/50 font-mono break-all leading-relaxed">{info.infoHash}</p>
+              </div>
+            </div>
+          </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          <HardDrive size={11} />
-          <span>P2P streaming</span>
+
+        {/* File List */}
+        <div className="md:col-span-8">
+          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
+            <div className="card-body p-5 gap-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center">
+                    <FolderOpen size={16} className="text-primary" />
+                  </div>
+                  <h2 className="card-title text-sm font-semibold">Included Files</h2>
+                </div>
+                <span className="badge badge-ghost badge-sm font-mono">
+                  {info.files.length} item{info.files.length > 1 ? 's' : ''}
+                </span>
+              </div>
+
+              <div className="space-y-1.5 max-h-[50vh] overflow-y-auto pr-1">
+                {info.files.map((f) => {
+                  const Icon = getFileIcon(f.name);
+                  return (
+                    <div
+                      key={f.index}
+                      className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-base-200/40 text-sm group/item hover:bg-base-200/70 transition-colors"
+                    >
+                      <Icon size={14} className="text-base-content/20 shrink-0" />
+                      <span className="truncate text-base-content/70 flex-1 min-w-0 group-hover/item:text-base-content transition-colors">{f.name}</span>
+                      <span className="text-base-content/30 text-xs shrink-0 font-mono tabular-nums">{formatBytes(f.size)}</span>
+                      {info.files.length > 1 && (
+                        <button
+                          className="btn btn-ghost btn-xs btn-circle shrink-0 opacity-0 group-hover/item:opacity-100 transition-opacity text-base-content/30 hover:text-primary"
+                          onClick={() => downloadFile(f.index)}
+                          title="Download this file"
+                        >
+                          <Download size={12} />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
         </div>
+
+        {/* Download Action */}
+        <div className="md:col-span-4">
+          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
+            <div className="card-body p-5 gap-4 justify-between">
+              <div>
+                <div className="flex items-center gap-3 mb-3">
+                  <div className="w-9 h-9 rounded-lg bg-success/10 flex items-center justify-center">
+                    <Download size={16} className="text-success" />
+                  </div>
+                  <h2 className="text-sm font-semibold">Ready to download?</h2>
+                </div>
+                <p className="text-xs text-base-content/40 leading-relaxed">
+                  {isSingleFile
+                    ? `${info.files[0].name} — ${formatBytes(info.files[0].size)}. Click below to start.`
+                    : `${info.files.length} files totaling ${formatBytes(info.totalSize)}. Download everything as a zip, or hover individual files.`
+                  }
+                </p>
+              </div>
+              <button
+                className="btn btn-primary w-full gap-2"
+                onClick={() => downloadFile(isSingleFile ? info.files[0].index : undefined)}
+              >
+                <Download size={16} />
+                {isSingleFile ? 'Download File' : 'Download All as .zip'}
+              </button>
+            </div>
+          </div>
+        </div>
+
       </div>
     </div>
   );
