@@ -20,6 +20,14 @@ export default function JoinRoom() {
   const downloadCallbacks = useRef(null);
   const hasReceivedData = useRef(false);
 
+  // Keep a ref in sync with downloadState so event handlers created earlier
+  // (e.g. the peer 'close' listener) always read the CURRENT value instead
+  // of a stale value captured when the closure was first created.
+  const downloadStateRef = useRef('idle');
+  useEffect(() => {
+    downloadStateRef.current = downloadState;
+  }, [downloadState]);
+
   useEffect(() => {
     if (!socket.connected) socket.connect();
 
@@ -57,10 +65,15 @@ export default function JoinRoom() {
           console.log('[ICE state - JoinRoom]', state);
         });
 
-        // Fallback: If peer closes during download, mark as complete
+        // Fallback: If peer closes during download, mark as complete.
+        // Uses downloadStateRef (not the closed-over downloadState) so this
+        // always checks the CURRENT state, not the state at connection time.
         hostPeer.current.on('close', () => {
-          console.log('[peer close - JoinRoom]', { downloadState, hasReceivedData: hasReceivedData.current });
-          if (downloadState === 'downloading' || hasReceivedData.current) {
+          console.log('[peer close - JoinRoom]', {
+            downloadState: downloadStateRef.current,
+            hasReceivedData: hasReceivedData.current,
+          });
+          if (downloadStateRef.current === 'downloading' || hasReceivedData.current) {
             handleDownloadComplete();
           }
         });
@@ -92,7 +105,13 @@ export default function JoinRoom() {
       }
       hostPeer.current?.destroy();
     };
-  }, [roomId, navigate]);
+    // IMPORTANT: only depend on roomId. Including `navigate` here was
+    // causing this effect to re-run whenever the navigate function's
+    // reference changed, which destroyed the peer connection right after
+    // it connected — that's what caused "User-Initiated Abort, reason=Close
+    // called" immediately after a successful connection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId]);
 
   const handleDownloadComplete = () => {
     if (downloadCallbacks.current?.stallTimer) {
@@ -131,18 +150,15 @@ export default function JoinRoom() {
     hasReceivedData.current = false;
 
     const stallTimer = setTimeout(() => {
-      // If we haven't received any data at all, it's actually stalled
       if (!hasReceivedData.current) {
         console.error('[download stalled - JoinRoom] no data received within 30s');
         toast.error('Download stalled — connection may have dropped');
         setDownloadState('idle');
         setProgress(null);
-      }
-      // If we received some data but onDone never fired, assume it completed
-      else {
+      } else {
         handleDownloadComplete();
       }
-    }, 30000); // 30 seconds instead of 15
+    }, 30000);
 
     downloadCallbacks.current = { stallTimer };
 
@@ -157,7 +173,6 @@ export default function JoinRoom() {
 
         setProgress(Math.min(Math.max(p, 0), 1));
 
-        // If progress reaches 100%, complete immediately
         if (p >= 1) {
           handleDownloadComplete();
         }
@@ -172,7 +187,6 @@ export default function JoinRoom() {
           clearTimeout(downloadCallbacks.current.stallTimer);
           downloadCallbacks.current.stallTimer = null;
         }
-        // If we already received data, still mark as complete
         if (hasReceivedData.current) {
           handleDownloadComplete();
           toast.success('Files received');
