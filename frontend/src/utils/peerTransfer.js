@@ -28,6 +28,26 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
     socket.emit('signal', { targetSocketId, signal });
   });
 
+  peer.on('connect', () => {
+    console.log('[RAW] channel readyState:', peer._channel?.readyState);
+    peer._channel?.addEventListener('message', (e) => {
+      console.log('[RAW CHANNEL MESSAGE]', typeof e.data, e.data instanceof ArrayBuffer ? e.data.byteLength : e.data);
+    });
+    peer._pc.getStats(null).then((stats) => {
+      stats.forEach((report) => {
+        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          const local = stats.get(report.localCandidateId);
+          const remote = stats.get(report.remoteCandidateId);
+          console.log('[ICE candidate pair]', {
+            local: local?.candidateType,
+            remote: remote?.candidateType,
+            protocol: local?.protocol,
+          });
+        }
+      });
+    });
+  });
+
   let disconnectTimer = null;
 
   peer._pc?.addEventListener?.('iceconnectionstatechange', () => {
