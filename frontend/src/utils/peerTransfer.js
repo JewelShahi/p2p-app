@@ -28,26 +28,6 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
     socket.emit('signal', { targetSocketId, signal });
   });
 
-  peer.on('connect', () => {
-    console.log('[RAW] channel readyState:', peer._channel?.readyState);
-    peer._channel?.addEventListener('message', (e) => {
-      console.log('[RAW CHANNEL MESSAGE]', typeof e.data, e.data instanceof ArrayBuffer ? e.data.byteLength : e.data);
-    });
-    peer._pc.getStats(null).then((stats) => {
-      stats.forEach((report) => {
-        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-          const local = stats.get(report.localCandidateId);
-          const remote = stats.get(report.remoteCandidateId);
-          console.log('[ICE candidate pair]', {
-            local: local?.candidateType,
-            remote: remote?.candidateType,
-            protocol: local?.protocol,
-          });
-        }
-      });
-    });
-  });
-
   let disconnectTimer = null;
 
   peer._pc?.addEventListener?.('iceconnectionstatechange', () => {
@@ -91,7 +71,13 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 
   console.log('[sendFiles] starting', { fileCount: files.length, totalSize, peerConnected: peer.connected });
 
-  const dataHandler = (data) => {
+  // NOTE: switched from peer.on('data', ...) to listening directly on the
+  // native RTCDataChannel. We proved via diagnostic logging that the native
+  // channel reliably delivers every message, but simple-peer's own 'data'
+  // event was NOT firing on the receiver side for this app/version — so we
+  // bypass simple-peer's wrapper for receiving and read the channel directly.
+  const channelMessageHandler = (event) => {
+    const data = event.data;
     if (typeof data === 'string') {
       const msg = JSON.parse(data);
       if (msg.type === 'cancel') {
@@ -100,7 +86,18 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
       }
     }
   };
-  peer.on('data', dataHandler);
+
+  const attachChannelListener = () => {
+    if (peer._channel) {
+      peer._channel.addEventListener('message', channelMessageHandler);
+    }
+  };
+
+  if (peer._channel) {
+    attachChannelListener();
+  } else {
+    peer.once('connect', attachChannelListener);
+  }
 
   const waitForConnect = () =>
     new Promise((resolve) => {
@@ -168,7 +165,9 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
       console.error('[sendFiles] error', err);
       onError?.(err);
     } finally {
-      peer.off('data', dataHandler);
+      if (peer._channel) {
+        peer._channel.removeEventListener('message', channelMessageHandler);
+      }
     }
   })();
 }
@@ -180,7 +179,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   let totalExpected = 0;
   const zipParts = [];
 
-  console.log('[receiveFiles] listening, peer connected:', peer.connected);
+  console.log('[receiveFiles] listening, peer connected:', peer.connected, 'channel exists:', !!peer._channel);
 
   let writeQueue = Promise.resolve();
   const enqueue = (task) => {
@@ -192,7 +191,14 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
     return writeQueue;
   };
 
-  peer.on('data', (data) => {
+  // NOTE: switched from peer.on('data', ...) to listening directly on the
+  // native RTCDataChannel (peer._channel). Diagnostic logging confirmed the
+  // native channel reliably delivers every message (file-start, chunks,
+  // file-end, transfer-complete, in order) but simple-peer's own 'data'
+  // event never fired here — so we read the channel directly instead of
+  // going through simple-peer's wrapper.
+  const channelMessageHandler = (event) => {
+    const data = event.data;
     enqueue(async () => {
       if (typeof data === 'string') {
         const msg = JSON.parse(data);
@@ -237,15 +243,35 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
         return;
       }
 
+      // Binary chunk. Native RTCDataChannel messages arrive as ArrayBuffer
+      // (not the Buffer/Uint8Array shim simple-peer normally hands you), but
+      // .byteLength works the same and both handle.write() and Blob parts
+      // accept ArrayBuffer directly, so nothing downstream needs to change.
       received += data.byteLength;
       onProgress?.(totalExpected ? Math.min(received / totalExpected, 1) : 0);
       if (writer?.write) await writer.write(data);
       else if (writer?.chunks) writer.chunks.push(data);
     });
-  });
+  };
+
+  const attachChannelListener = () => {
+    if (peer._channel) {
+      peer._channel.addEventListener('message', channelMessageHandler);
+    } else {
+      console.warn('[receiveFiles] peer._channel not available yet, will attach on connect');
+      peer.once('connect', () => {
+        peer._channel?.addEventListener('message', channelMessageHandler);
+      });
+    }
+  };
+
+  attachChannelListener();
 
   peer.on('close', () => {
     console.log('[receiveFiles] peer closed, bytes received so far:', received);
+    if (peer._channel) {
+      peer._channel.removeEventListener('message', channelMessageHandler);
+    }
     enqueue(async () => {
       if (writer?.abort) await writer.abort();
       onError?.('connection-lost');
