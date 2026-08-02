@@ -33,10 +33,39 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
   // simple-peer doesn't always surface ICE failure as an 'error' event —
   // watch the underlying RTCPeerConnection directly so a dead connection
   // doesn't just sit silently at 0% forever.
+  // NOTE: 'disconnected' is often transient (brief packet loss, wifi hiccup,
+  // NAT re-negotiation) and frequently self-recovers back to 'connected'.
+  // Only treat it as fatal if it hasn't recovered after a grace period.
+  let disconnectTimer = null;
+
   peer._pc?.addEventListener?.('iceconnectionstatechange', () => {
     const state = peer._pc.iceConnectionState;
-    if (state === 'failed' || state === 'disconnected') {
+
+    if (state === 'connected' || state === 'completed') {
+      if (disconnectTimer) {
+        clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+      }
+      return;
+    }
+
+    if (state === 'failed') {
+      if (disconnectTimer) {
+        clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+      }
       onFailed?.(state);
+      return;
+    }
+
+    if (state === 'disconnected') {
+      if (disconnectTimer) clearTimeout(disconnectTimer);
+      disconnectTimer = setTimeout(() => {
+        const current = peer._pc?.iceConnectionState;
+        if (current === 'disconnected' || current === 'failed') {
+          onFailed?.(current);
+        }
+      }, 5000); // grace period — adjust if needed
     }
   });
 
@@ -110,57 +139,72 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   let totalExpected = 0;
   const zipParts = [];
 
-  peer.on('data', async (data) => {
-    if (typeof data === 'string') {
-      const msg = JSON.parse(data);
+  // Serialize all writes so out-of-order/overlapping async writes can't
+  // scramble the file — each chunk waits for the previous one to finish.
+  let writeQueue = Promise.resolve();
+  const enqueue = (task) => {
+    writeQueue = writeQueue.then(task).catch((err) => {
+      onError?.('write-error');
+      throw err;
+    });
+    return writeQueue;
+  };
 
-      if (msg.type === 'file-start') {
-        currentMeta = msg;
-        totalExpected += msg.size;
+  peer.on('data', (data) => {
+    enqueue(async () => {
+      if (typeof data === 'string') {
+        const msg = JSON.parse(data);
 
-        const handle = fileHandles?.get(msg.id);
-        if (mode === 'individual' && handle) {
-          writer = await handle.createWritable();
-        } else {
-          writer = { chunks: [] };
+        if (msg.type === 'file-start') {
+          currentMeta = msg;
+          totalExpected += msg.size;
+
+          const handle = fileHandles?.get(msg.id);
+          if (mode === 'individual' && handle) {
+            writer = await handle.createWritable();
+          } else {
+            writer = { chunks: [] };
+          }
+          return;
+        }
+
+        if (msg.type === 'file-end') {
+          if (mode === 'individual' && writer?.close) {
+            await writer.close();
+          } else if (mode === 'individual') {
+            triggerDownload(new Blob(writer.chunks), currentMeta.name);
+          } else if (mode === 'zip') {
+            zipParts.push({ name: currentMeta.name, blob: new Blob(writer.chunks) });
+          }
+          writer = null;
+          return;
+        }
+
+        if (msg.type === 'transfer-complete') {
+          if (mode === 'zip') {
+            const JSZip = (await import('jszip')).default;
+            const zip = new JSZip();
+            zipParts.forEach((p) => zip.file(p.name, p.blob));
+            const blob = await zip.generateAsync({ type: 'blob' });
+            triggerDownload(blob, 'download.zip');
+          }
+          onDone?.();
         }
         return;
       }
 
-      if (msg.type === 'file-end') {
-        if (mode === 'individual' && writer?.close) {
-          await writer.close();
-        } else if (mode === 'individual') {
-          triggerDownload(new Blob(writer.chunks), currentMeta.name);
-        } else if (mode === 'zip') {
-          zipParts.push({ name: currentMeta.name, blob: new Blob(writer.chunks) });
-        }
-        writer = null;
-        return;
-      }
-
-      if (msg.type === 'transfer-complete') {
-        if (mode === 'zip') {
-          const JSZip = (await import('jszip')).default;
-          const zip = new JSZip();
-          zipParts.forEach((p) => zip.file(p.name, p.blob));
-          const blob = await zip.generateAsync({ type: 'blob' });
-          triggerDownload(blob, 'download.zip');
-        }
-        onDone?.();
-      }
-      return;
-    }
-
-    received += data.byteLength;
-    onProgress?.(totalExpected ? Math.min(received / totalExpected, 1) : 0);
-    if (writer?.write) await writer.write(data);
-    else if (writer?.chunks) writer.chunks.push(data);
+      received += data.byteLength;
+      onProgress?.(totalExpected ? Math.min(received / totalExpected, 1) : 0);
+      if (writer?.write) await writer.write(data);
+      else if (writer?.chunks) writer.chunks.push(data);
+    });
   });
 
-  peer.on('close', async () => {
-    if (writer?.abort) await writer.abort();
-    onError?.('connection-lost');
+  peer.on('close', () => {
+    enqueue(async () => {
+      if (writer?.abort) await writer.abort();
+      onError?.('connection-lost');
+    });
   });
   peer.on('error', () => onError?.('connection-error'));
 }
