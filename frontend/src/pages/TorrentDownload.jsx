@@ -12,6 +12,7 @@ export default function TorrentDownload() {
   const magnet = state?.magnet;
   const [info, setInfo] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null); // NEW: Store the actual error message
 
   useEffect(() => {
     if (!magnet) {
@@ -19,9 +20,24 @@ export default function TorrentDownload() {
       return;
     }
     setLoading(true);
+    setError(null);
+    
     api.get('/torrent/info', { params: { magnet } })
-      .then((res) => setInfo(res.data))
-      .catch(() => {})
+      .then((res) => {
+        if (res.data.ok) {
+          setInfo(res.data);
+        } else {
+          // Server returned a structured error (e.g. 400 bad request)
+          setError(res.data.error || 'Invalid torrent source');
+        }
+      })
+      .catch((err) => {
+        // FIX: Extract the actual error message from the backend response
+        // instead of completely swallowing it with () => {}
+        const msg = err.response?.data?.error || err.message || 'Network error or server crashed.';
+        setError(msg);
+        console.error('[Torrent Info Error]', msg);
+      })
       .finally(() => setLoading(false));
   }, [magnet, navigate]);
 
@@ -37,6 +53,24 @@ export default function TorrentDownload() {
         <div className="card bg-base-100 shadow-sm border border-base-300/50 px-10 py-8 flex flex-col items-center gap-4">
           <span className="loading loading-spinner loading-lg text-primary" />
           <p className="text-sm text-base-content/50 font-medium">Resolving torrent...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // NEW: Detailed error state
+  if (error) {
+    return (
+      <div className="min-h-[calc(100vh-4rem)] flex items-center justify-center p-4">
+        <div className="card bg-base-100 shadow-sm border border-error/30 px-10 py-8 flex flex-col items-center gap-4 max-w-md text-center">
+          <div className="w-14 h-14 rounded-2xl bg-error/10 flex items-center justify-center">
+            <FolderArchive size={24} className="text-error" />
+          </div>
+          <p className="text-sm font-semibold text-base-content/80">Could not resolve that link.</p>
+          <div className="bg-base-200/50 rounded-lg p-3 w-full text-left">
+            <p className="text-xs text-error/80 font-mono break-words leading-relaxed">{error}</p>
+          </div>
+          <button onClick={() => navigate('/')} className="btn btn-ghost btn-sm mt-2">Return Home</button>
         </div>
       </div>
     );

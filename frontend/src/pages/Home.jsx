@@ -33,17 +33,19 @@ export default function Home() {
   };
 
   const openMagnet = () => {
-    if (!magnet.startsWith('magnet:')) {
-      toast.error('That does not look like a valid magnet link');
+    const trimmed = magnet.trim();
+    
+    // Updated validation: Accepts both magnet:? and https:// links
+    if (!trimmed.startsWith('magnet:') && !trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+      toast.error('Please enter a valid magnet link or .torrent URL', { id: 'invalid-torrent' });
       return;
     }
-    navigate('/torrent', { state: { magnet } });
+    
+    navigate('/torrent', { state: { magnet: trimmed } });
   };
 
   return (
     <div data-theme={theme} className="min-h-screen flex flex-col">
-
-      {/* ── Header ── */}
 
       {/* ── Main content ── */}
       <main className="flex-1 flex items-center justify-center px-4 sm:px-6 pb-16 overflow-visible">
@@ -51,12 +53,9 @@ export default function Home() {
 
           {/* Hero text */}
           <div className="text-center mb-10 sm:mb-14">
-
             <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-[3.4rem] font-bold tracking-tight leading-[1.1] text-base-content">
               Share files,{' '}
-              <span className="text-primary">
-                peer to peer
-              </span>
+              <span className="text-primary">peer to peer</span>
             </h1>
             <p className="mt-3 sm:mt-4 text-sm sm:text-base text-base-content/40 max-w-lg mx-auto leading-relaxed px-2">
               Create a room or fetch a torrent — no sign-up, no uploads to a server. Files go directly between devices.
@@ -119,7 +118,7 @@ export default function Home() {
                     <div className="min-w-0 pt-0.5">
                       <h2 className="card-title text-[17px] sm:text-lg text-base-content">Download a torrent</h2>
                       <p className="text-[13px] text-base-content/40 mt-1 leading-relaxed">
-                        Paste a magnet link to fetch it through the server.
+                        Paste a magnet link or a .torrent URL to fetch it.
                       </p>
                     </div>
                   </div>
@@ -128,12 +127,12 @@ export default function Home() {
 
                   <div className="space-y-2.5 flex-1">
                     <label className="label text-[12px] font-medium text-base-content/40 uppercase tracking-wider py-0">
-                      Magnet link
+                      Magnet or .torrent URL
                     </label>
                     <textarea
                       className="textarea textarea-bordered w-full text-[13px] leading-relaxed resize-none bg-base-200 border-base-300 text-base-content/80 placeholder:text-base-content/25 focus:border-secondary focus:outline-none transition-colors duration-300"
                       rows={2}
-                      placeholder="magnet:?xt=urn:btih:..."
+                      placeholder="magnet:?xt=urn:btih:... or https://...file.torrent"
                       value={magnet}
                       onChange={(e) => setMagnet(e.target.value)}
                     />
