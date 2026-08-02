@@ -1,44 +1,41 @@
-// archiver is a CommonJS package and doesn't expose a clean ESM default
-// export, so Node's loader can't auto-detect it — pull it in via createRequire instead.
 import { createRequire } from 'module';
 import client from '../utils/torrentClient.js';
 
 const require = createRequire(import.meta.url);
 const archiver = require('archiver');
 
-const ADD_TIMEOUT_MS = 30_000; // fail fast if a magnet has no reachable peers/metadata
+const ADD_TIMEOUT_MS = 30_000;
 
-// If the same magnet is already active on the shared client (two requests for
-// the same file, a double-click, etc.), reuse it instead of calling
-// client.add() again — adding a duplicate throws and previously crashed the process.
-function getOrAdd(magnet, onTorrent) {
-  const existing = client.get(magnet);
+const isValidTorrentSource = (source) => {
+  if (!source || typeof source !== 'string') return false;
+  return source.startsWith('magnet:') || source.startsWith('http://') || source.startsWith('https://');
+};
+
+function getOrAdd(source, onTorrent) {
+  const existing = client.get(source);
   if (existing) {
     if (existing.ready) onTorrent(existing);
     else existing.once('ready', () => onTorrent(existing));
     return;
   }
-  client.add(magnet, { destroyStoreOnDestroy: true }, onTorrent);
+  client.add(source, { destroyStoreOnDestroy: true }, onTorrent);
 }
 
-// GET /api/torrent/info?magnet=<uri>
-// Resolves metadata only (file list + sizes) without downloading data,
-// so the frontend can show "here's what this magnet contains" before committing.
 export function getInfo(req, res) {
-  const magnet = req.query.magnet;
-  if (!magnet || !magnet.startsWith('magnet:')) {
-    return res.status(400).json({ ok: false, error: 'valid magnet link required' });
+  const source = req.query.magnet;
+  if (!isValidTorrentSource(source)) {
+    return res.status(400).json({ ok: false, error: 'Valid magnet link or .torrent URL required' });
   }
 
   let settled = false;
   const timeout = setTimeout(() => {
     if (settled) return;
     settled = true;
-    res.status(504).json({ ok: false, error: 'timed out resolving magnet metadata' });
+    res.status(504).json({ ok: false, error: 'Timed out resolving torrent metadata' });
   }, ADD_TIMEOUT_MS);
 
-  getOrAdd(magnet, (torrent) => {
-    if (settled) return; // a concurrent request for the same magnet may already be handling this
+  getOrAdd(source, (torrent) => {
+    if (settled) return;
     settled = true;
     clearTimeout(timeout);
 
@@ -49,30 +46,25 @@ export function getInfo(req, res) {
       totalSize: torrent.length,
       files: torrent.files.map((f, i) => ({ index: i, name: f.name, size: f.length })),
     });
-    // No torrent.destroy() here — a concurrent request for the same magnet
-    // may still be attached to this same shared torrent instance.
   });
 }
 
-// GET /api/torrent/download?magnet=<uri>&fileIndex=<n>
-// Streams a single file straight through to the HTTP response.
-// Omit fileIndex to auto-pick the only file, or zip everything if there are multiple.
 export function download(req, res) {
-  const magnet = req.query.magnet;
+  const source = req.query.magnet;
   const fileIndex = req.query.fileIndex !== undefined ? parseInt(req.query.fileIndex, 10) : null;
 
-  if (!magnet || !magnet.startsWith('magnet:')) {
-    return res.status(400).json({ ok: false, error: 'valid magnet link required' });
+  if (!isValidTorrentSource(source)) {
+    return res.status(400).json({ ok: false, error: 'Valid magnet link or .torrent URL required' });
   }
 
   let settled = false;
   const timeout = setTimeout(() => {
     if (settled) return;
     settled = true;
-    res.status(504).json({ ok: false, error: 'timed out finding peers for this magnet' });
+    res.status(504).json({ ok: false, error: 'Timed out finding peers for this torrent' });
   }, ADD_TIMEOUT_MS);
 
-  getOrAdd(magnet, (torrent) => {
+  getOrAdd(source, (torrent) => {
     if (settled) return;
     settled = true;
     clearTimeout(timeout);
