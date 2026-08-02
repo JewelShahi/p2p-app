@@ -41,33 +41,21 @@ export default function HostRoom() {
 
   const hasConnectedOnce = useRef(false);
 
+  // Mirror of `peers` readable inside socket handlers set up once at mount
+  // (their closures would otherwise only ever see the initial empty array).
+  const peersRef = useRef([]);
+  useEffect(() => {
+    peersRef.current = peers;
+  }, [peers]);
+
   useEffect(() => {
     if (!socket.connected) socket.connect();
 
-    // Fires on the FIRST connection too, not just reconnects — we only act
-    // on subsequent ones (socket.io auto-reconnects after a drop).
-    const handleConnect = () => {
-      if (!hasConnectedOnce.current) {
-        hasConnectedOnce.current = true;
-        return;
-      }
-      if (!hostUserId.current) return; // can't resume without our stable id
-
-      socket.emit('rejoin-room', { roomId, userId: hostUserId.current }, (res) => {
-        if (!res?.ok) {
-          toast.error('This session could not be resumed');
-          navigate('/');
-          return;
-        }
-        toast.success('Back online');
-      });
-    };
-    socket.on('connect', handleConnect);
-
-    socket.on('peer-joined', ({ peerSocketId, peerUserId }) => {
-      toast.success('A new device connected');
-      setPeers((p) => [...p, { socketId: peerSocketId, userId: peerUserId }]);
-
+    // Creates (or re-creates) a WebRTC connection to a peer. Used for a
+    // brand-new join, for rebuilding connections after the host itself
+    // reconnects, and for redoing a specific peer's connection after THEY
+    // reconnect under a new socket id.
+    const connectToPeer = (peerSocketId) => {
       const peer = createPeerConnection({
         initiator: true,
         socket,
@@ -95,6 +83,74 @@ export default function HostRoom() {
         console.log('[peer close - HostRoom]', peerSocketId);
         delete peerConnections.current[peerSocketId];
       });
+
+      return peer;
+    };
+
+    // Fires on the FIRST connection too, not just reconnects — we only act
+    // on subsequent ones (socket.io auto-reconnects after a drop).
+    const handleConnect = () => {
+      if (!hasConnectedOnce.current) {
+        hasConnectedOnce.current = true;
+        return;
+      }
+      if (!hostUserId.current) return; // can't resume without our stable id
+
+      socket.emit('rejoin-room', { roomId, userId: hostUserId.current }, (res) => {
+        if (!res?.ok) {
+          toast.error('This session could not be resumed');
+          navigate('/');
+          return;
+        }
+        toast.success('Back online');
+
+        // The server's member list is the source of truth for who's still
+        // actually in the room. Add anyone we don't already know about (or
+        // don't already have a live connection object for) to our local
+        // state and re-establish WebRTC with them — this is what fixes the
+        // "peers.length is 0 / Send button disabled" bug after a host
+        // reconnect wiped local React state.
+        if (Array.isArray(res.members)) {
+          setPeers((prev) => {
+            const known = new Set(prev.map((p) => p.socketId));
+            const additions = res.members.filter((m) => !known.has(m.socketId));
+            return additions.length ? [...prev, ...additions] : prev;
+          });
+          res.members.forEach((m) => {
+            if (!peerConnections.current[m.socketId]) {
+              connectToPeer(m.socketId);
+            }
+          });
+        }
+      });
+    };
+    socket.on('connect', handleConnect);
+
+    // A PEER (not us) reconnected under a new socket id. Their old
+    // connection object, if any, is almost certainly dead — tear it down
+    // and start a fresh WebRTC handshake targeting their new socket id.
+    socket.on('peer-reconnected', ({ userId, socketId }) => {
+      const stalePeer = peersRef.current.find((p) => p.userId === userId);
+      if (stalePeer && stalePeer.socketId !== socketId) {
+        peerConnections.current[stalePeer.socketId]?.destroy();
+        delete peerConnections.current[stalePeer.socketId];
+      }
+
+      toast.success('A device reconnected');
+      setPeers((prev) => {
+        const filtered = prev.filter((p) => p.userId !== userId);
+        return [...filtered, { socketId, userId }];
+      });
+
+      if (!peerConnections.current[socketId]) {
+        connectToPeer(socketId);
+      }
+    });
+
+    socket.on('peer-joined', ({ peerSocketId, peerUserId }) => {
+      toast.success('A new device connected');
+      setPeers((p) => [...p, { socketId: peerSocketId, userId: peerUserId }]);
+      connectToPeer(peerSocketId);
     });
 
     socket.on('signal', ({ fromSocketId, signal }) => {
@@ -155,6 +211,7 @@ export default function HostRoom() {
 
     return () => {
       socket.off('connect', handleConnect);
+      socket.off('peer-reconnected');
       socket.off('peer-joined');
       socket.off('signal');
       socket.off('peer-left');

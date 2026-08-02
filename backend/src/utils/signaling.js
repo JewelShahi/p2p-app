@@ -115,9 +115,18 @@ export function registerSignaling(io, roomManager) {
         expiresAt: room.expiresAt,
         remainingSeconds: roomManager.remainingSeconds(roomId),
         currentOffer: room.currentOffer,
+        // Host needs the current member list to rebuild its peers UI and
+        // re-establish WebRTC connections after a reconnect wiped its local
+        // React state — a plain 'rejoin-room' ack alone isn't enough.
+        members: wasHost
+          ? Array.from(room.members.values()).map((m) => ({ socketId: m.socketId, userId: m.userId }))
+          : undefined,
       });
 
-      socket.to(roomId).emit('peer-reconnected', { userId, isHost: wasHost });
+      // Include the reconnecting party's NEW socket id so the other side(s)
+      // can tear down any stale peer connection (keyed by the old socket id)
+      // and start a fresh WebRTC handshake instead of silently doing nothing.
+      socket.to(roomId).emit('peer-reconnected', { userId, isHost: wasHost, socketId: socket.id });
     });
 
     // ---------- WEBRTC SIGNAL RELAY ----------

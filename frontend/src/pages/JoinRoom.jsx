@@ -112,6 +112,20 @@ export default function JoinRoom() {
       hostPeer.current.signal(signal);
     });
 
+    socket.on('peer-reconnected', ({ isHost }) => {
+      if (!isHost) return; // only the host reconnecting matters on this side
+      toast.success('Host reconnected');
+      if (hostPeer.current) {
+        // The old connection is almost certainly dead after the host's
+        // socket dropped and came back under a new id. Destroy it and null
+        // it out so the next 'signal' event (which the host will send once
+        // it re-initiates) builds a fresh peer connection instead of trying
+        // to feed a new handshake into a stale, likely-closed one.
+        hostPeer.current.destroy();
+        hostPeer.current = null;
+      }
+    });
+
     socket.on('file-offer', (incomingOffer) => {
       toast.success('The host wants to send you files');
       setOffer(incomingOffer);
@@ -127,6 +141,7 @@ export default function JoinRoom() {
 
     return () => {
       socket.off('connect', handleConnect);
+      socket.off('peer-reconnected');
       socket.off('signal');
       socket.off('file-offer');
       socket.off('room-closed');
