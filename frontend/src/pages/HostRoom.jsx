@@ -23,7 +23,6 @@ export default function HostRoom() {
 
   const peerConnections = useRef({});
   const peerRetryCount = useRef({});
-  const pendingSends = useRef({});
   const filesRef = useRef([]);
   useEffect(() => { filesRef.current = files; }, [files]);
 
@@ -38,10 +37,6 @@ export default function HostRoom() {
 
   const peersRef = useRef([]);
   useEffect(() => { peersRef.current = peers; }, [peers]);
-
-  // Tracks whether we've completed at least one successful rejoin so we can
-  // show the "Reconnecting…" badge only on ACTUAL reconnects, not on the
-  // harmless initial rejoin that fires on mount.
   const hasJoinedOnce = useRef(false);
 
   useEffect(() => {
@@ -51,8 +46,6 @@ export default function HostRoom() {
     };
 
     const connectToPeer = (peerSocketId) => {
-      const existingPending = pendingSends.current[peerSocketId];
-
       const peer = createPeerConnection({
         initiator: true,
         socket,
@@ -61,7 +54,6 @@ export default function HostRoom() {
           console.error('[peer onFailed]', peerSocketId, failState);
           peerConnections.current[peerSocketId]?.destroy();
           delete peerConnections.current[peerSocketId];
-          delete pendingSends.current[peerSocketId];
 
           const attempts = (peerRetryCount.current[peerSocketId] || 0) + 1;
           peerRetryCount.current[peerSocketId] = attempts;
@@ -86,12 +78,6 @@ export default function HostRoom() {
       peer.on('connect', () => {
         toast.success('Direct connection established', { id: 'peer-connected' });
         peerRetryCount.current[peerSocketId] = 0;
-
-        const pending = pendingSends.current[peerSocketId];
-        if (pending) {
-          delete pendingSends.current[peerSocketId];
-          doSendFiles(peer, peerSocketId, pending.files);
-        }
       });
 
       peer.on('error', (err) => {
@@ -106,12 +92,7 @@ export default function HostRoom() {
       peer.on('close', () => {
         console.log('[peer close]', peerSocketId);
         delete peerConnections.current[peerSocketId];
-        delete pendingSends.current[peerSocketId];
       });
-
-      if (existingPending) {
-        pendingSends.current[peerSocketId] = existingPending;
-      }
 
       return peer;
     };
@@ -125,6 +106,8 @@ export default function HostRoom() {
         onDone: () => {
           toast.success('Transfer complete', { id: 'transfer-done' });
           setTransfers((t) => ({ ...t, [socketId]: 1 }));
+          // Do NOT destroy the peer — keep it alive for the next batch.
+          // sendFiles' finally block already removes its cancel listener.
         },
         onCancel: () => {
           toast('Peer cancelled the download', { icon: '🛑', id: 'transfer-cancelled' });
@@ -138,59 +121,38 @@ export default function HostRoom() {
       });
     };
 
-    // ──── REJOIN — the single function that syncs host state with server ────
-    // Called on EVERY connect event AND once on mount if already connected.
-    // The server handles duplicate rejoins gracefully (idempotent), so
-    // calling this "too many times" is harmless — calling it TOO FEW times
-    // (the old hasConnectedOnce bug) is what caused the empty-room bug.
+    // ──── REJOIN ────
     const tryRejoin = () => {
       if (!hostUserId.current) return;
 
-      // Only show the "Reconnecting…" badge on actual reconnects, not on
-      // the first mount where we're just doing a harmless sync.
       const isFirstJoin = !hasJoinedOnce.current;
-      if (!isFirstJoin) {
-        setIsReconnecting(true);
-      }
+      if (!isFirstJoin) setIsReconnecting(true);
 
       socket.emit('rejoin-room', { roomId, userId: hostUserId.current }, (res) => {
-        if (!isFirstJoin) {
-          setIsReconnecting(false);
-        }
+        if (!isFirstJoin) setIsReconnecting(false);
         hasJoinedOnce.current = true;
 
         if (!res?.ok) {
-          // On the very first join, a failure means the room genuinely
-          // doesn't exist (expired, server restarted, etc). Navigate away.
-          // On a reconnect, same thing — session can't be recovered.
           toast.error('This session could not be resumed', { id: 'rejoin-fail' });
           navigate('/');
           return;
         }
 
-        // Only toast "Back online" on actual reconnects
-        if (!isFirstJoin) {
-          toast.success('Back online', { id: 'rejoin-success' });
-        }
+        if (!isFirstJoin) toast.success('Back online', { id: 'rejoin-success' });
 
         if (Array.isArray(res.members)) {
           const newSocketIds = new Set(res.members.map((m) => m.socketId));
 
-          // Destroy connections to peers no longer in the room
           for (const oldSid of Object.keys(peerConnections.current)) {
             if (!newSocketIds.has(oldSid)) {
               peerConnections.current[oldSid]?.destroy();
               delete peerConnections.current[oldSid];
               delete peerRetryCount.current[oldSid];
-              delete pendingSends.current[oldSid];
             }
           }
 
-          // REPLACE peers entirely — don't merge with stale entries.
-          // The server only returns live, connected members.
           setPeers(res.members);
 
-          // Re-establish WebRTC with anyone we don't have a live connection to
           res.members.forEach((m) => {
             if (!isPeerReady(peerConnections.current[m.socketId])) {
               if (peerConnections.current[m.socketId]) {
@@ -205,22 +167,13 @@ export default function HostRoom() {
       });
     };
 
-    // Register the connect handler BEFORE checking socket.connected, so
-    // we catch reconnects that happen between this line and the check below.
     socket.on('connect', tryRejoin);
 
-    // If the socket is already connected (normal case: we just created the
-    // room on the home page and navigated here), the 'connect' event won't
-    // fire again. We MUST call tryRejoin manually or we'll never sync.
-    // This is harmless on first mount — the server returns an empty member
-    // list and we set peers to [] (which it already is).
     if (socket.connected) {
       tryRejoin();
     } else {
       socket.connect();
     }
-
-    // ──── Other socket handlers ────
 
     socket.on('peer-reconnected', ({ userId, socketId }) => {
       const stalePeer = peersRef.current.find((p) => p.userId === userId);
@@ -228,7 +181,6 @@ export default function HostRoom() {
         peerConnections.current[stalePeer.socketId]?.destroy();
         delete peerConnections.current[stalePeer.socketId];
         delete peerRetryCount.current[stalePeer.socketId];
-        delete pendingSends.current[stalePeer.socketId];
       }
 
       toast.success('A device reconnected', { id: 'peer-reconnected' });
@@ -264,7 +216,6 @@ export default function HostRoom() {
       peerConnections.current[peerSocketId]?.destroy();
       delete peerConnections.current[peerSocketId];
       delete peerRetryCount.current[peerSocketId];
-      delete pendingSends.current[peerSocketId];
     });
 
     socket.on('file-response', ({ fromSocketId, accept }) => {
@@ -275,15 +226,21 @@ export default function HostRoom() {
 
       const peer = peerConnections.current[fromSocketId];
 
+      // SIMPLIFIED: since we keep the peer alive between batches, it
+      // should almost always be ready here. Only recreate if it actually
+      // died (e.g. network drop that ICE couldn't recover from).
       if (!isPeerReady(peer)) {
-        console.log('[file-response] peer not ready, recreating connection to', fromSocketId);
+        console.log('[file-response] peer not ready, recreating', fromSocketId);
         if (peer) {
           peer.destroy();
           delete peerConnections.current[fromSocketId];
           delete peerRetryCount.current[fromSocketId];
         }
-        pendingSends.current[fromSocketId] = { files: filesRef.current };
-        connectToPeer(fromSocketId);
+        const newPeer = connectToPeer(fromSocketId);
+        // Wait for the new peer to connect before sending
+        newPeer.once('connect', () => {
+          doSendFiles(newPeer, fromSocketId, filesRef.current);
+        });
         return;
       }
 
@@ -348,9 +305,6 @@ export default function HostRoom() {
   };
 
   const terminateRoom = () => {
-    // Block if we're not actually connected or still waiting for rejoin to
-    // complete — prevents the race where terminate-room arrives at the
-    // server before rejoin-room and fails because socket.data is empty.
     if (!socket.connected || isReconnecting) {
       toast.error(!socket.connected ? 'No connection — please wait' : 'Still reconnecting — please wait', { id: 'terminate-blocked' });
       return;

@@ -7,7 +7,7 @@ import socket from '../api/socket';
 import CountdownTimer from '../components/CountdownTimer';
 import FileOfferModal from '../components/FileOfferModal';
 import TransferProgress from '../components/TransferProgress';
-import { createPeerConnection, receiveFiles } from '../utils/peerTransfer';
+import { createPeerConnection, receiveFiles, cleanupReceiveListener } from '../utils/peerTransfer';
 
 export default function JoinRoom() {
   const { roomId } = useParams();
@@ -20,28 +20,21 @@ export default function JoinRoom() {
   const [isReconnecting, setIsReconnecting] = useState(false);
 
   const hostPeer = useRef(null);
+  const hostSocketIdRef = useRef(null);
   const hostRetryCount = useRef(0);
   const downloadCallbacks = useRef(null);
   const hasReceivedData = useRef(false);
   const isReceivingRef = useRef(false);
-  const waitingForPeerRef = useRef(false);
-  const pendingDownloadConfig = useRef(null);
   const lastOfferIdRef = useRef(null);
 
   const downloadStateRef = useRef('idle');
   useEffect(() => { downloadStateRef.current = downloadState; }, [downloadState]);
 
-  // Keep offer in a ref so the effect-internal respond implementation
-  // always reads the current value, not a stale closure capture.
   const offerRef = useRef(null);
   useEffect(() => { offerRef.current = offer; }, [offer]);
 
   const myUserId = useRef(sessionStorage.getItem(`peerUserId:${roomId}`) || null);
   const hasJoinedOnce = useRef(false);
-
-  // Ref that holds the actual respond logic — populated inside useEffect
-  // so it has direct access to startReceiveFiles without going through
-  // another ref indirection that can be null at the wrong time.
   const respondImplRef = useRef(null);
 
   useEffect(() => {
@@ -50,15 +43,16 @@ export default function JoinRoom() {
         clearTimeout(downloadCallbacks.current.stallTimer);
         downloadCallbacks.current = null;
       }
+      cleanupReceiveListener();
       setDownloadState('idle');
       setProgress(null);
       hasReceivedData.current = false;
       isReceivingRef.current = false;
-      waitingForPeerRef.current = false;
-      pendingDownloadConfig.current = null;
     };
 
     const handleDownloadComplete = () => {
+      if (downloadStateRef.current === 'complete') return;
+
       if (downloadCallbacks.current?.stallTimer) {
         clearTimeout(downloadCallbacks.current.stallTimer);
         downloadCallbacks.current = null;
@@ -68,19 +62,16 @@ export default function JoinRoom() {
       hasReceivedData.current = false;
       isReceivingRef.current = false;
 
-      // Destroy peer after each download so the next batch gets a fresh
-      // connection — prevents stale data channel listeners from stacking
-      // and causing the doubled-toast bug on the 2nd/3rd batch.
-      if (hostPeer.current) {
-        const oldPeer = hostPeer.current;
-        hostPeer.current = null;
-        oldPeer.destroy();
-      }
+      // Do NOT destroy the peer. Keeping it alive means:
+      // - No need to recreate it for the 2nd/3rd batch
+      // - No race conditions with listener attachment
+      // - No waitingForPeerRef/pendingDownloadConfig complexity
+      // - The old channel listener is cleaned up by receiveFiles itself
     };
 
     const startReceiveFiles = (mode, fileHandles) => {
       if (!hostPeer.current) {
-        console.error('[startReceiveFiles] no peer — should not happen on direct path');
+        console.error('[startReceiveFiles] no peer');
         clearDownloadState();
         toast.error('Connection lost unexpectedly', { id: 'no-peer-receive' });
         return;
@@ -110,7 +101,6 @@ export default function JoinRoom() {
             downloadCallbacks.current.stallTimer = null;
           }
           setProgress(Math.min(Math.max(p, 0), 1));
-          if (p >= 1) handleDownloadComplete();
         },
         onDone: () => {
           handleDownloadComplete();
@@ -123,8 +113,8 @@ export default function JoinRoom() {
             clearTimeout(downloadCallbacks.current.stallTimer);
             downloadCallbacks.current = null;
           }
+          cleanupReceiveListener();
           isReceivingRef.current = false;
-          waitingForPeerRef.current = false;
           if (hasReceivedData.current) {
             handleDownloadComplete();
             toast.success('Files received', { id: 'files-received-fallback' });
@@ -191,21 +181,26 @@ export default function JoinRoom() {
 
     // ──── WebRTC signaling ────
     socket.on('signal', ({ fromSocketId, signal }) => {
-      // If signal comes from a different socketId than our current peer,
-      // the host reconnected. Destroy old peer so we create a fresh one.
-      if (hostPeer.current && hostPeer.current._options?.targetSocketId !== fromSocketId) {
-        console.log('[signal] from new socketId', fromSocketId, '— destroying old peer');
+      const isFromDifferentHost = hostSocketIdRef.current !== null &&
+                                  hostSocketIdRef.current !== fromSocketId;
+
+      if (hostPeer.current && isFromDifferentHost) {
+        console.log('[signal] from new host socketId', fromSocketId, '(was', hostSocketIdRef.current, ') — destroying old peer');
+        cleanupReceiveListener();
         hostPeer.current.destroy();
         hostPeer.current = null;
       }
 
       if (!hostPeer.current) {
+        hostSocketIdRef.current = fromSocketId;
+
         hostPeer.current = createPeerConnection({
           initiator: false,
           socket,
           targetSocketId: fromSocketId,
           onFailed: (failState) => {
             console.error('[peer onFailed]', failState);
+            cleanupReceiveListener();
             hostPeer.current?.destroy();
             hostPeer.current = null;
 
@@ -223,16 +218,6 @@ export default function JoinRoom() {
         hostPeer.current.on('connect', () => {
           toast.success('Direct connection established', { id: 'peer-connected' });
           hostRetryCount.current = 0;
-
-          // If we accepted a file offer and are waiting for a fresh peer
-          // connection (because we destroyed the old one after the previous
-          // download), now's the time to start receiving.
-          if (waitingForPeerRef.current && pendingDownloadConfig.current) {
-            waitingForPeerRef.current = false;
-            const { mode, fileHandles } = pendingDownloadConfig.current;
-            pendingDownloadConfig.current = null;
-            startReceiveFiles(mode, fileHandles);
-          }
         });
 
         hostPeer.current.on('error', (err) => {
@@ -248,8 +233,8 @@ export default function JoinRoom() {
           console.log('[peer close]', {
             downloadState: downloadStateRef.current,
             hasReceivedData: hasReceivedData.current,
-            waitingForPeer: waitingForPeerRef.current,
           });
+          cleanupReceiveListener();
           if (downloadStateRef.current === 'downloading' && hasReceivedData.current) {
             handleDownloadComplete();
           }
@@ -259,9 +244,11 @@ export default function JoinRoom() {
       hostPeer.current.signal(signal);
     });
 
-    socket.on('peer-reconnected', ({ isHost }) => {
+    socket.on('peer-reconnected', ({ isHost, socketId }) => {
       if (!isHost) return;
       toast.success('Host reconnected', { id: 'host-reconnected' });
+      hostSocketIdRef.current = socketId;
+      cleanupReceiveListener();
       if (hostPeer.current) {
         hostPeer.current.destroy();
         hostPeer.current = null;
@@ -272,10 +259,7 @@ export default function JoinRoom() {
       if (incomingOffer.offerId === lastOfferIdRef.current) return;
       lastOfferIdRef.current = incomingOffer.offerId;
 
-      // Full reset for a fresh offer — clears leftover state from any
-      // previous download so the new one starts clean.
       clearDownloadState();
-
       toast.success('The host wants to send you files', { id: 'file-offer-toast' });
       setOffer(incomingOffer);
     });
@@ -294,11 +278,7 @@ export default function JoinRoom() {
       console.log('[socket disconnect] connection dropped, will auto-recover…');
     });
 
-    // ──── Store the respond implementation INSIDE the effect ────
-    // This is the key structural fix: respond needs direct access to
-    // startReceiveFiles (which is also in this effect). Using a ref
-    // indirection (respondRef.current?.startReceiveFiles) was fragile
-    // and could be null at the exact moment the user clicked download.
+    // ──── Respond implementation ────
     respondImplRef.current = async (accept, mode) => {
       const currentOffer = offerRef.current;
       if (!currentOffer) return;
@@ -341,44 +321,29 @@ export default function JoinRoom() {
       setProgress(0);
       hasReceivedData.current = false;
 
-      // ──── THE CRITICAL FIX ────
-      // Use simple-peer's PUBLIC `connected` property (a getter that
-      // internally checks both the RTCPeerConnection state AND the data
-      // channel readyState). The previous code reached into the private
-      // `_channel` property which either doesn't exist in some versions
-      // or returns unexpected values, causing this check to ALWAYS fail.
-      // That made every download — even the first one — fall into the
-      // "wait for peer" path and hit the 30-second timeout error.
+      // ──── SIMPLIFIED: no more waitingForPeerRef/pendingDownloadConfig ────
+      // Since we keep the peer alive between batches, it should always be
+      // connected here. The only exception is if the peer died between
+      // the file-offer and the user clicking Download — extremely unlikely
+      // but handled by the error path.
       if (hostPeer.current && !hostPeer.current.destroyed && hostPeer.current.connected) {
         console.log('[respond] peer is ready — receiving directly');
         startReceiveFiles(mode, fileHandles);
         return;
       }
 
-      // Peer doesn't exist (we destroyed it after the previous download)
-      // or isn't connected yet. Store the config and wait for the host
-      // to re-initiate signaling — the peer's 'connect' handler above
-      // will pick up pendingDownloadConfig and call startReceiveFiles.
-      console.log('[respond] peer NOT ready — waiting for host to re-initiate', {
+      // Peer is dead (shouldn't happen in normal flow since we don't
+      // destroy it). Show error and let the user try again when the host
+      // re-sends the offer (which would trigger a new peer-reconnected).
+      console.error('[respond] peer NOT ready', {
         exists: !!hostPeer.current,
         destroyed: hostPeer.current?.destroyed,
         connected: hostPeer.current?.connected,
       });
-      waitingForPeerRef.current = true;
-      pendingDownloadConfig.current = { mode, fileHandles };
-
-      const stallTimer = setTimeout(() => {
-        if (waitingForPeerRef.current) {
-          console.error('[respond] timed out waiting for peer connection');
-          toast.error('Connection to host lost — the host may need to re-send the files', { id: 'peer-timeout' });
-          isReceivingRef.current = false;
-          waitingForPeerRef.current = false;
-          pendingDownloadConfig.current = null;
-          setDownloadState('idle');
-          setProgress(null);
-        }
-      }, 30000);
-      downloadCallbacks.current = { stallTimer };
+      toast.error('Connection to host was lost — please wait for the host to re-send', { id: 'peer-dead' });
+      isReceivingRef.current = false;
+      setDownloadState('idle');
+      setProgress(null);
     };
 
     return () => {
@@ -392,15 +357,13 @@ export default function JoinRoom() {
       if (downloadCallbacks.current?.stallTimer) {
         clearTimeout(downloadCallbacks.current.stallTimer);
       }
+      cleanupReceiveListener();
       hostPeer.current?.destroy();
       respondImplRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  // Public respond function — thin wrapper that delegates to the
-  // implementation stored inside the effect. This is what FileOfferModal
-  // calls when the user clicks Download or Decline.
   const respond = async (accept, mode) => {
     if (respondImplRef.current) {
       return respondImplRef.current(accept, mode);

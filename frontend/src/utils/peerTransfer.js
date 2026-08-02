@@ -1,11 +1,12 @@
+// peerTransfer.js
 import SimplePeer from 'simple-peer';
 import toast from 'react-hot-toast';
 import { createElement } from 'react';
 
 const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-const CHUNK_SIZE = 64 * 1024; // raised from 16KB now that we listen on the native channel directly and know delivery is reliable — improves throughput
-const BACKPRESSURE_LIMIT = 2 * 1024 * 1024; // raised from 1MB — the write-queue serialization + pre-send backpressure check already prevent corruption regardless of chunk size, so this is safe to raise for speed
+const CHUNK_SIZE = 64 * 1024;
+const BACKPRESSURE_LIMIT = 2 * 1024 * 1024;
 
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -21,6 +22,26 @@ const ICE_SERVERS = [
     credential: 'openrelayproject',
   },
 ];
+
+// ──── Module-level receive listener tracking ────
+// Allows cleanup between successive receiveFiles() calls on the same peer
+// (e.g. 2nd/3rd batch) without listener stacking, which was the root cause
+// of doubled toasts and corrupted downloads.
+let _recvHandler = null;
+let _recvChannel = null;
+let _recvPendingConnect = null;
+
+/**
+ * Remove the active receive channel listener (if any). Called at the start
+ * of each receiveFiles() and from JoinRoom's peer 'close' handler.
+ */
+export function cleanupReceiveListener() {
+  if (_recvHandler && _recvChannel) {
+    try { _recvChannel.removeEventListener('message', _recvHandler); } catch {}
+  }
+  _recvHandler = null;
+  _recvChannel = null;
+}
 
 export function createPeerConnection({ initiator, socket, targetSocketId, onFailed }) {
   const peer = new SimplePeer({
@@ -38,18 +59,12 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
     const state = peer._pc.iceConnectionState;
 
     if (state === 'connected' || state === 'completed') {
-      if (disconnectTimer) {
-        clearTimeout(disconnectTimer);
-        disconnectTimer = null;
-      }
+      if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
       return;
     }
 
     if (state === 'failed') {
-      if (disconnectTimer) {
-        clearTimeout(disconnectTimer);
-        disconnectTimer = null;
-      }
+      if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
       onFailed?.(state);
       return;
     }
@@ -75,11 +90,6 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 
   console.log('[sendFiles] starting', { fileCount: files.length, totalSize, peerConnected: peer.connected });
 
-  // NOTE: switched from peer.on('data', ...) to listening directly on the
-  // native RTCDataChannel. We proved via diagnostic logging that the native
-  // channel reliably delivers every message, but simple-peer's own 'data'
-  // event was NOT firing on the receiver side for this app/version — so we
-  // bypass simple-peer's wrapper for receiving and read the channel directly.
   const channelMessageHandler = (event) => {
     const data = event.data;
     if (typeof data === 'string') {
@@ -94,6 +104,8 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
   const attachChannelListener = () => {
     if (peer._channel) {
       peer._channel.addEventListener('message', channelMessageHandler);
+    } else {
+      peer.once('connect', attachChannelListener);
     }
   };
 
@@ -105,15 +117,8 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 
   const waitForConnect = () =>
     new Promise((resolve) => {
-      if (peer.connected) {
-        console.log('[sendFiles] peer already connected');
-        return resolve();
-      }
-      console.log('[sendFiles] waiting for peer to connect...');
-      peer.once('connect', () => {
-        console.log('[sendFiles] peer connected event fired');
-        resolve();
-      });
+      if (peer.connected) return resolve();
+      peer.once('connect', () => resolve());
     });
 
   (async () => {
@@ -134,14 +139,11 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
           for (let o = 0; o < value.byteLength; o += CHUNK_SIZE) {
             if (cancelled) break;
 
-            // Wait for buffer to drain BEFORE sending, not just after —
-            // sending while already over the limit can pile up faster
-            // than the channel drains, especially on slower/lossy links.
             while (peer._channel && peer._channel.bufferedAmount > BACKPRESSURE_LIMIT) {
               await new Promise((r) => setTimeout(r, 50));
             }
 
-            const slice = value.slice(o, o + CHUNK_SIZE); // .slice() copies, .subarray() was a view — copy is safer across async boundaries
+            const slice = value.slice(o, o + CHUNK_SIZE);
             peer.send(slice);
             sentTotal += slice.byteLength;
             chunkCount++;
@@ -154,10 +156,6 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
       if (!cancelled) {
         peer.send(JSON.stringify({ type: 'transfer-complete' }));
 
-        // Wait until the data channel has ACTUALLY flushed everything —
-        // not just queued it — before telling the UI "done". Otherwise
-        // closing/navigating right after can drop still-buffered bytes,
-        // silently corrupting the file on the receiver's end.
         while (peer._channel && peer._channel.bufferedAmount > 0) {
           await new Promise((r) => setTimeout(r, 50));
         }
@@ -177,11 +175,25 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 }
 
 export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onError }) {
+  // ──── Clean up any previous listener from a prior batch ────
+  // This is THE fix for the 2nd/3rd batch bug. Previously, each call
+  // to receiveFiles added a NEW listener to the same channel without
+  // removing the old one — so every chunk was processed N times (N =
+  // batch number), causing doubled toasts, corrupted files, and
+  // eventually a frozen download.
+  cleanupReceiveListener();
+
+  // Also clean up any pending connect handler from a previous call
+  if (_recvPendingConnect) {
+    try { peer.off('connect', _recvPendingConnect); } catch {}
+    _recvPendingConnect = null;
+  }
+
   let writer = null;
   let currentMeta = null;
   let received = 0;
   let totalExpected = 0;
-  let completed = false; // set once transfer-complete has actually been processed
+  let completed = false;
   const zipParts = [];
 
   console.log('[receiveFiles] listening, peer connected:', peer.connected, 'channel exists:', !!peer._channel);
@@ -196,14 +208,13 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
     return writeQueue;
   };
 
-  // NOTE: switched from peer.on('data', ...) to listening directly on the
-  // native RTCDataChannel (peer._channel). Diagnostic logging confirmed the
-  // native channel reliably delivers every message (file-start, chunks,
-  // file-end, transfer-complete, in order) but simple-peer's own 'data'
-  // event never fired here — so we read the channel directly instead of
-  // going through simple-peer's wrapper.
   const channelMessageHandler = (event) => {
     const data = event.data;
+    // Guard: if this handler has been superseded by a new receiveFiles
+    // call, ignore the message. (Shouldn't happen since we remove the
+    // listener above, but this is a safety net.)
+    if (_recvHandler !== channelMessageHandler) return;
+
     enqueue(async () => {
       if (typeof data === 'string') {
         const msg = JSON.parse(data);
@@ -249,10 +260,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
         return;
       }
 
-      // Binary chunk. Native RTCDataChannel messages arrive as ArrayBuffer
-      // (not the Buffer/Uint8Array shim simple-peer normally hands you), but
-      // .byteLength works the same and both handle.write() and Blob parts
-      // accept ArrayBuffer directly, so nothing downstream needs to change.
+      // Binary chunk
       received += data.byteLength;
       onProgress?.(totalExpected ? Math.min(received / totalExpected, 1) : 0);
       if (writer?.write) await writer.write(data);
@@ -260,35 +268,31 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
     });
   };
 
+  // Store at module level so cleanupReceiveListener() can remove it
+  _recvHandler = channelMessageHandler;
+
   const attachChannelListener = () => {
     if (peer._channel) {
+      _recvChannel = peer._channel;
       peer._channel.addEventListener('message', channelMessageHandler);
     } else {
       console.warn('[receiveFiles] peer._channel not available yet, will attach on connect');
-      peer.once('connect', () => {
+      _recvPendingConnect = () => {
+        _recvPendingConnect = null;
+        _recvChannel = peer._channel;
         peer._channel?.addEventListener('message', channelMessageHandler);
-      });
+      };
+      peer.once('connect', _recvPendingConnect);
     }
   };
 
   attachChannelListener();
 
-  peer.on('close', () => {
-    console.log('[receiveFiles] peer closed, bytes received so far:', received, 'completed:', completed);
-    if (peer._channel) {
-      peer._channel.removeEventListener('message', channelMessageHandler);
-    }
-    if (completed) return; // transfer already finished successfully — closing now is normal, not an error
-    enqueue(async () => {
-      if (writer?.abort) await writer.abort();
-      onError?.('connection-lost');
-    });
-  });
-  peer.on('error', (err) => {
-    console.error('[receiveFiles] peer error', err);
-    if (completed) return; // ignore late transport errors after a successful transfer
-    onError?.('connection-error');
-  });
+  // ──── NO peer.on('close') or peer.on('error') here ────
+  // The caller (JoinRoom) handles those events and calls
+  // cleanupReceiveListener() when appropriate. Having them here caused
+  // stacking when receiveFiles was called multiple times on the same
+  // peer — each call added ANOTHER close/error handler.
 }
 
 function triggerDownload(blob, name) {
@@ -304,20 +308,15 @@ function triggerDownload(blob, name) {
   };
 
   if (!isMobile) {
-    // Desktop browsers handle a programmatic click fine even outside a
-    // direct user gesture — keep the original instant-download behavior.
     doDownload();
-    URL.revokeObjectURL(url);
+    // FIX: Don't revoke immediately — the browser needs the URL to be
+    // valid when it actually reads the blob data for the download.
+    // Revoking too fast could truncate the file on slower systems.
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
     return;
   }
 
-  // On mobile (especially Android Chrome), clicking a download anchor from
-  // inside an async callback has lost the "trusted user gesture" that
-  // existed when the user originally tapped Accept. The browser then
-  // silently accepts or blocks the download with no visible confirmation —
-  // this is exactly the "says downloaded but nothing saved/no popup" bug.
-  // Showing a toast with a real tappable button means the user's tap IS
-  // the gesture, so the browser shows its normal download notification.
+  // Mobile: show toast with tappable Save button (trusted user gesture)
   const revokeTimer = setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
 
   toast(
@@ -347,5 +346,5 @@ function triggerDownload(blob, name) {
 export function cancelTransfer(peer) {
   try {
     peer.send(JSON.stringify({ type: 'cancel' }));
-  } catch { }
+  } catch {}
 }
