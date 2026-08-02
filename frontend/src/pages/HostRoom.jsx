@@ -137,6 +137,10 @@ export default function HostRoom() {
       size: file.size,
     }));
     setFiles(list);
+    // A fresh file selection means whatever is currently shown under
+    // "Transfers" (e.g. a previous round's 100% bars) no longer applies —
+    // clear it so the new round doesn't render mixed with stale progress.
+    setTransfers({});
   };
 
   const totalSize = files.reduce((s, f) => s + f.size, 0);
@@ -150,6 +154,10 @@ export default function HostRoom() {
       toast.error('Total size exceeds the 10GB limit');
       return;
     }
+    // Clear stale progress from a previous round before starting a new
+    // offer, so the Transfers panel doesn't show old and new rounds mixed
+    // together (e.g. a peer stuck at 100% from the last batch).
+    setTransfers({});
     socket.emit('file-offer', {
       files: files.map((f) => ({ id: f.id, name: f.name, size: f.size })),
       totalSize,

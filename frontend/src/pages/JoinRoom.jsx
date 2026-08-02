@@ -260,12 +260,13 @@ export default function JoinRoom() {
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
             <div className="card-body p-5 gap-4">
               <div className="flex items-center gap-3">
-                <div className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors duration-300 ${downloadState === 'complete'
+                <div className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors duration-300 ${
+                  downloadState === 'complete'
                     ? 'bg-success/10'
                     : downloadState === 'downloading'
                       ? 'bg-primary/10'
                       : 'bg-base-200/70'
-                  }`}>
+                }`}>
                   {downloadState === 'complete' ? (
                     <CheckCircle2 size={16} className="text-success" />
                   ) : downloadState === 'downloading' ? (
@@ -344,12 +345,13 @@ export default function JoinRoom() {
               <div className="space-y-3">
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-base-content/40">Status</span>
-                  <span className={`badge badge-sm gap-1 ${downloadState === 'downloading'
+                  <span className={`badge badge-sm gap-1 ${
+                    downloadState === 'downloading'
                       ? 'badge-primary'
                       : downloadState === 'complete'
                         ? 'badge-success'
                         : 'badge-success'
-                    }`}>
+                  }`}>
                     {downloadState === 'downloading' ? 'Transferring' : 'Connected'}
                   </span>
                 </div>

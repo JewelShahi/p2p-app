@@ -1,7 +1,11 @@
 import SimplePeer from 'simple-peer';
+import toast from 'react-hot-toast';
+import { createElement } from 'react';
 
-const CHUNK_SIZE = 16 * 1024;
-const BACKPRESSURE_LIMIT = 1 * 1024 * 1024; // lowered from 4MB — large buffers were likely overwhelming the channel
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+const CHUNK_SIZE = 64 * 1024; // raised from 16KB now that we listen on the native channel directly and know delivery is reliable — improves throughput
+const BACKPRESSURE_LIMIT = 2 * 1024 * 1024; // raised from 1MB — the write-queue serialization + pre-send backpressure check already prevent corruption regardless of chunk size, so this is safe to raise for speed
 
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -285,13 +289,55 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
 
 function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+
+  const doDownload = () => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  if (!isMobile) {
+    // Desktop browsers handle a programmatic click fine even outside a
+    // direct user gesture — keep the original instant-download behavior.
+    doDownload();
+    URL.revokeObjectURL(url);
+    return;
+  }
+
+  // On mobile (especially Android Chrome), clicking a download anchor from
+  // inside an async callback has lost the "trusted user gesture" that
+  // existed when the user originally tapped Accept. The browser then
+  // silently accepts or blocks the download with no visible confirmation —
+  // this is exactly the "says downloaded but nothing saved/no popup" bug.
+  // Showing a toast with a real tappable button means the user's tap IS
+  // the gesture, so the browser shows its normal download notification.
+  const revokeTimer = setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
+
+  toast(
+    (t) =>
+      createElement(
+        'div',
+        { className: 'flex items-center gap-3' },
+        createElement('span', null, `${name} is ready`),
+        createElement(
+          'button',
+          {
+            className: 'btn btn-sm btn-primary',
+            onClick: () => {
+              doDownload();
+              toast.dismiss(t.id);
+              clearTimeout(revokeTimer);
+              setTimeout(() => URL.revokeObjectURL(url), 2000);
+            },
+          },
+          'Save file'
+        )
+      ),
+    { duration: 5 * 60 * 1000 }
+  );
 }
 
 export function cancelTransfer(peer) {
