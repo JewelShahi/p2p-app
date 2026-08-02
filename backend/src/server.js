@@ -25,7 +25,7 @@ app.set('trust proxy', 1);
 // 2. Prevent accidental '*' wildcard CORS fallbacks in production environments
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN;
 const allowedOrigin = (origin, callback) => {
-  if (!origin || origin.endsWith(".vercel.app") || origin === "http://localhost:3000") {
+  if (!origin || origin.endsWith(".vercel.app") || origin.endsWith(".onrender.com") || origin === "http://localhost:3000") {
     callback(null, true);
   } else {
     callback(new Error("Not allowed by CORS"));
@@ -49,7 +49,7 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
-      if (!origin || origin.endsWith(".vercel.app") || origin === "http://localhost:3000") {
+      if (!origin || origin.endsWith(".vercel.app") || origin.endsWith(".onrender.com") || origin === "http://localhost:3000") {
         callback(null, true);
       } else {
         callback(new Error("Not allowed by CORS"));

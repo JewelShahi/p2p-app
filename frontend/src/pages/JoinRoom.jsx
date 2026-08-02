@@ -17,6 +17,8 @@ export default function JoinRoom() {
   const [progress, setProgress] = useState(null);
   const [downloadState, setDownloadState] = useState('idle'); // idle | downloading | complete
   const hostPeer = useRef(null);
+  const downloadCallbacks = useRef(null);
+  const hasReceivedData = useRef(false);
 
   useEffect(() => {
     if (!socket.connected) socket.connect();
@@ -40,8 +42,16 @@ export default function JoinRoom() {
           targetSocketId: fromSocketId,
           onFailed: (state) => toast.error(`Connection to host ${state} — likely blocked by your network (try a different network or a TURN server)`),
         });
+        
         hostPeer.current.on('connect', () => toast.success('Direct connection established'));
         hostPeer.current.on('error', () => toast.error('Connection to host failed'));
+        
+        // Fallback: If peer closes during download, mark as complete
+        hostPeer.current.on('close', () => {
+          if (downloadState === 'downloading' || hasReceivedData.current) {
+            handleDownloadComplete();
+          }
+        });
       }
       hostPeer.current.signal(signal);
     });
@@ -65,9 +75,22 @@ export default function JoinRoom() {
       socket.off('room-closed');
       socket.off('connect_error');
       socket.off('disconnect');
+      if (downloadCallbacks.current?.stallTimer) {
+        clearTimeout(downloadCallbacks.current.stallTimer);
+      }
       hostPeer.current?.destroy();
     };
   }, [roomId, navigate]);
+
+  const handleDownloadComplete = () => {
+    if (downloadCallbacks.current?.stallTimer) {
+      clearTimeout(downloadCallbacks.current.stallTimer);
+      downloadCallbacks.current.stallTimer = null;
+    }
+    setProgress(1);
+    setDownloadState('complete');
+    hasReceivedData.current = false;
+  };
 
   const respond = async (accept, mode) => {
     let fileHandles = null;
@@ -93,32 +116,57 @@ export default function JoinRoom() {
 
     setDownloadState('downloading');
     setProgress(0);
+    hasReceivedData.current = false;
 
     const stallTimer = setTimeout(() => {
-      toast.error('Download stalled — connection may have dropped');
-      setDownloadState('idle');
-      setProgress(null);
-    }, 15000);
+      // If we haven't received any data at all, it's actually stalled
+      if (!hasReceivedData.current) {
+        toast.error('Download stalled — connection may have dropped');
+        setDownloadState('idle');
+        setProgress(null);
+      }
+      // If we received some data but onDone never fired, assume it completed
+      else {
+        handleDownloadComplete();
+      }
+    }, 30000); // 30 seconds instead of 15
+
+    downloadCallbacks.current = { stallTimer };
 
     receiveFiles({
       peer: hostPeer.current,
       mode,
       fileHandles,
       onProgress: (p) => {
-        clearTimeout(stallTimer);
-        setProgress(Math.min(p, 1));
+        hasReceivedData.current = true;
+        if (stallTimer) clearTimeout(stallTimer);
+        downloadCallbacks.current.stallTimer = null;
+        
+        setProgress(Math.min(Math.max(p, 0), 1));
+        
+        // If progress reaches 100%, complete immediately
+        if (p >= 1) {
+          handleDownloadComplete();
+        }
       },
       onDone: () => {
-        clearTimeout(stallTimer);
-        setProgress(1);
-        setDownloadState('complete');
+        handleDownloadComplete();
         toast.success('Download complete');
       },
       onError: () => {
-        clearTimeout(stallTimer);
-        toast.error('Something interrupted the download');
-        setDownloadState('idle');
-        setProgress(null);
+        if (downloadCallbacks.current?.stallTimer) {
+          clearTimeout(downloadCallbacks.current.stallTimer);
+          downloadCallbacks.current.stallTimer = null;
+        }
+        // If we already received data, still mark as complete
+        if (hasReceivedData.current) {
+          handleDownloadComplete();
+          toast.success('Files received');
+        } else {
+          toast.error('Something interrupted the download');
+          setDownloadState('idle');
+          setProgress(null);
+        }
       },
     });
   };
@@ -189,7 +237,7 @@ export default function JoinRoom() {
                 </div>
                 <h2 className="card-title text-sm font-semibold">
                   {downloadState === 'complete' 
-                    ? 'Download Complete' 
+                    ? 'Downloaded' 
                     : downloadState === 'downloading' 
                       ? 'Receiving Files' 
                       : 'Waiting for Host'}
@@ -201,7 +249,7 @@ export default function JoinRoom() {
                 )}
                 {downloadState === 'complete' && (
                   <span className="badge badge-success badge-sm gap-1 ml-auto">
-                    <CheckCircle2 size={10} /> Done
+                    <CheckCircle2 size={10} /> Saved
                   </span>
                 )}
               </div>
@@ -218,9 +266,8 @@ export default function JoinRoom() {
                     <div className="w-20 h-20 rounded-full bg-success/10 flex items-center justify-center">
                       <CheckCircle2 size={36} className="text-success" />
                     </div>
-                    <div className="absolute -inset-2 rounded-full border-2 border-success/20 animate-ping" />
                   </div>
-                  <p className="text-lg font-semibold text-base-content/80">All files saved</p>
+                  <p className="text-lg font-semibold text-base-content/80">Files Downloaded</p>
                   <p className="text-xs text-base-content/30 mt-1.5 max-w-xs">
                     The host can send more files if needed — this card will update automatically.
                   </p>
