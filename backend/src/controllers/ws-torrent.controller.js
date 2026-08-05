@@ -9,10 +9,14 @@ const isValidSource = (s) => {
 function getTorrent(source, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const existing = client.get(source);
+    
     let existingTorrent = null;
-    if (existing && typeof existing === 'object' && !existing.destroyed) {
+    
+    // FIXED: Strictly check if it's a real Torrent object by looking for the .once method
+    if (existing && typeof existing === 'object' && typeof existing.once === 'function' && !existing.destroyed) {
       existingTorrent = existing;
-    } else if (typeof existing === 'string') {
+    } 
+    else if (typeof existing === 'string') {
       existingTorrent = client.torrents.find(t => t.infoHash === existing && !t.destroyed) || null;
     }
 

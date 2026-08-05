@@ -10,11 +10,14 @@ function getTorrent(source, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     const existing = client.get(source);
 
-    // client.get() can return a string (infoHash) or a Torrent object
     let existingTorrent = null;
-    if (existing && typeof existing === 'object' && !existing.destroyed) {
+    
+    // FIXED: Strictly check if it's a real Torrent object by looking for the .once method
+    if (existing && typeof existing === 'object' && typeof existing.once === 'function' && !existing.destroyed) {
       existingTorrent = existing;
-    } else if (typeof existing === 'string') {
+    } 
+    // Sometimes it returns just the infoHash string
+    else if (typeof existing === 'string') {
       existingTorrent = client.torrents.find(t => t.infoHash === existing && !t.destroyed) || null;
     }
 
