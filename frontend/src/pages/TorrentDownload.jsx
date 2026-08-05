@@ -53,6 +53,13 @@ export default function TorrentDownload() {
       return;
     }
 
+    // FAST CLIENT-SIDE CHECK: Stop direct file URLs instantly before hitting the server
+    if ((magnet.startsWith('http://') || magnet.startsWith('https://')) && !magnet.toLowerCase().endsWith('.torrent')) {
+      setError('Direct file URLs (like .iso, .zip, .exe) are not supported. You must paste a Magnet Link (starts with magnet:?) or a link to a .torrent file.');
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     setError(null);
 
@@ -65,7 +72,8 @@ export default function TorrentDownload() {
         }
       })
       .catch((err) => {
-        const msg = err.response?.data?.error || err.message || 'Network error';
+        // Gracefully handle 400 and 500 errors from the backend
+        const msg = err.response?.data?.error || err.message || 'Network error or server crashed.';
         setError(msg);
       })
       .finally(() => setLoading(false));
@@ -86,9 +94,7 @@ export default function TorrentDownload() {
 
     let fileHandle;
     try {
-      const fileName = info.files.length === 1
-        ? info.files[0].name
-        : `${info.name}.zip`;
+      const fileName = info.files.length === 1 ? info.files[0].name : `${info.name}.zip`;
       fileHandle = await window.showSaveFilePicker({ suggestedName: fileName });
       setWsFileName(fileName);
     } catch (err) {
@@ -194,15 +200,9 @@ export default function TorrentDownload() {
           <div className="w-12 h-12 rounded-2xl bg-error/10 flex items-center justify-center mx-auto mb-4">
             <AlertTriangle size={20} className="text-error" />
           </div>
-          <p className="text-sm font-semibold mb-3">Could not resolve that torrent</p>
+          <p className="text-sm font-semibold mb-3">Could not resolve that link</p>
           <div className="bg-error/5 rounded-lg p-3 mb-5 text-left">
             <p className="text-xs text-error/70 font-mono break-words leading-relaxed">{error}</p>
-          </div>
-          <div className="text-xs text-base-content/40 mb-5 leading-relaxed text-left">
-            This usually means:<br />
-            • The torrent has no seeders<br />
-            • It uses DHT-only peer discovery (disabled on this server)<br />
-            • The magnet link is malformed
           </div>
           <button onClick={() => navigate('/')} className="btn btn-primary btn-sm">Return Home</button>
         </div>
@@ -217,7 +217,6 @@ export default function TorrentDownload() {
 
   return (
     <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
-
       {/* Top Bar */}
       <div className="navbar bg-base-100 rounded-2xl shadow-sm border border-base-300/50 px-4 sm:px-6 mb-6">
         <div className="flex-1 flex gap-3">
@@ -236,7 +235,6 @@ export default function TorrentDownload() {
 
       {/* Bento Grid */}
       <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
-
         {/* Size */}
         <div className="md:col-span-4">
           <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
@@ -300,10 +298,7 @@ export default function TorrentDownload() {
                 {info.files.map((f) => {
                   const Icon = getFileIcon(f.name);
                   return (
-                    <div
-                      key={f.index}
-                      className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-base-200/40 text-sm group/item hover:bg-base-200/70 transition-colors"
-                    >
+                    <div key={f.index} className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-base-200/40 text-sm group/item hover:bg-base-200/70 transition-colors">
                       <Icon size={14} className="text-base-content/20 shrink-0" />
                       <span className="truncate text-base-content/70 flex-1 min-w-0 group-hover/item:text-base-content transition-colors">
                         {f.path || f.name}
@@ -358,16 +353,10 @@ export default function TorrentDownload() {
                         </span>
                         <span className="font-mono">{Math.round(wsProgress * 100)}%</span>
                       </div>
-                      <progress
-                        className="progress progress-secondary w-full"
-                        value={wsProgress}
-                        max="1"
-                      />
+                      <progress className="progress progress-secondary w-full" value={wsProgress} max="1" />
                     </div>
                     <p className="text-[10px] text-base-content/30">
-                      {wsStatus === 'connecting'
-                        ? 'Waiting for torrent metadata and peers...'
-                        : `Writing to ${wsFileName}`}
+                      {wsStatus === 'connecting' ? 'Waiting for torrent metadata and peers...' : `Writing to ${wsFileName}`}
                     </p>
                   </div>
                 ) : (

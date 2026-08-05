@@ -6,20 +6,14 @@ const isValidSource = (s) => {
   return t.startsWith('magnet:') || t.startsWith('http://') || t.startsWith('https://');
 };
 
-// Centralized promise wrapper to safely handle WebTorrent's async behavior
 function getTorrent(source, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     const existing = client.get(source);
 
     let existingTorrent = null;
-    
-    // client.get() can return a string (infoHash) or an invalid internal object.
-    // We STRICTLY check for .once to ensure it's a real Torrent instance.
     if (existing && typeof existing === 'object' && typeof existing.once === 'function' && !existing.destroyed) {
       existingTorrent = existing;
-    } 
-    // Fallback if it returned just the infoHash string
-    else if (typeof existing === 'string') {
+    } else if (typeof existing === 'string') {
       existingTorrent = client.torrents.find(t => t.infoHash === existing && !t.destroyed) || null;
     }
 
@@ -70,7 +64,6 @@ function getTorrent(source, timeoutMs = 45000) {
   });
 }
 
-// GET /api/torrent/info
 export const getInfo = async (req, res, next) => {
   try {
     const { magnet } = req.query;
@@ -78,13 +71,8 @@ export const getInfo = async (req, res, next) => {
       return res.status(400).json({ ok: false, error: 'Invalid magnet link or URL' });
     }
 
-    // CRITICAL: Block direct file URLs (like .iso, .zip, .exe).
-    // WebTorrent only accepts magnet links or URLs to .torrent files.
     if ((magnet.startsWith('http://') || magnet.startsWith('https://')) && !magnet.toLowerCase().endsWith('.torrent')) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: 'Direct file URLs are not supported. Please use a magnet link or a URL pointing to a .torrent file.' 
-      });
+      return res.status(400).json({ ok: false, error: 'Direct file URLs are not supported. Please use a magnet link or a URL pointing to a .torrent file.' });
     }
 
     const torrent = await getTorrent(magnet);
@@ -102,18 +90,13 @@ export const getInfo = async (req, res, next) => {
       }))
     });
   } catch (err) {
-    // Catch bencode parse errors from bad URLs/Files
     if (err.message && err.message.includes('not a number')) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: 'Invalid torrent file. The URL did not return valid torrent data.' 
-      });
+      return res.status(400).json({ ok: false, error: 'Invalid torrent file. The URL did not return valid torrent data.' });
     }
     next(err);
   }
 };
 
-// GET /api/torrent/download
 export const download = async (req, res, next) => {
   try {
     const { magnet, fileIndex } = req.query;
@@ -121,16 +104,12 @@ export const download = async (req, res, next) => {
       return res.status(400).json({ ok: false, error: 'Invalid magnet link or URL' });
     }
 
-    // CRITICAL: Block direct file URLs here too
     if ((magnet.startsWith('http://') || magnet.startsWith('https://')) && !magnet.toLowerCase().endsWith('.torrent')) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: 'Direct file URLs are not supported. Please use a magnet link or a URL pointing to a .torrent file.' 
-      });
+      return res.status(400).json({ ok: false, error: 'Direct file URLs are not supported. Please use a magnet link or a URL pointing to a .torrent file.' });
     }
 
     const idx = fileIndex !== undefined ? parseInt(fileIndex, 10) : null;
-    const torrent = await getTorrent(magnet, 120000); // 2 min timeout for downloads
+    const torrent = await getTorrent(magnet, 120000);
 
     let targetFile;
     if (idx !== null && torrent.files[idx]) {
@@ -140,7 +119,6 @@ export const download = async (req, res, next) => {
     }
 
     if (targetFile) {
-      // Single file download
       res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(targetFile.name)}`);
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Content-Length', targetFile.length);
@@ -156,7 +134,6 @@ export const download = async (req, res, next) => {
 
       res.on('close', () => stream.destroy());
     } else {
-      // Multiple files -> zip
       const { default: archiver } = await import('archiver');
       res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(torrent.name + '.zip')}`);
       res.setHeader('Content-Type', 'application/zip');
@@ -177,12 +154,8 @@ export const download = async (req, res, next) => {
       });
     }
   } catch (err) {
-    // Catch bencode parse errors here too
     if (err.message && err.message.includes('not a number')) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: 'Invalid torrent file. The URL did not return valid torrent data.' 
-      });
+      return res.status(400).json({ ok: false, error: 'Invalid torrent file. The URL did not return valid torrent data.' });
     }
     next(err);
   }
