@@ -1,168 +1,162 @@
-import { WebSocketServer } from 'ws';
-import { createRequire } from 'module';
 import client from '../utils/torrentClient.js';
 
-const require = createRequire(import.meta.url);
-const archiver = require('archiver');
-
-const isValidTorrentSource = (source) => {
-  if (!source || typeof source !== 'string') return false;
-  const trimmed = source.trim();
-  return trimmed.startsWith('magnet:') || trimmed.startsWith('http://') || trimmed.startsWith('https://');
+const isValidSource = (s) => {
+  if (!s || typeof s !== 'string') return false;
+  const t = s.trim();
+  return t.startsWith('magnet:') || t.startsWith('http://') || t.startsWith('https://');
 };
 
-function getOrAdd(source, onTorrent, onError) {
-  try {
+function getTorrent(source, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
     const existing = client.get(source);
     let existingTorrent = null;
-
-    if (existing) {
-      if (typeof existing === 'object' && typeof existing.once === 'function') {
-        existingTorrent = existing;
-      } else if (typeof existing === 'string') {
-        existingTorrent = client.torrents.find(t => t.infoHash === existing) || null;
-      }
+    if (existing && typeof existing === 'object' && !existing.destroyed) {
+      existingTorrent = existing;
+    } else if (typeof existing === 'string') {
+      existingTorrent = client.torrents.find(t => t.infoHash === existing && !t.destroyed) || null;
     }
 
     if (existingTorrent) {
-      if (existingTorrent.ready) onTorrent(existingTorrent);
-      else {
-        existingTorrent.once('ready', () => onTorrent(existingTorrent));
-        existingTorrent.once('error', (err) => onError?.(err));
-      }
+      if (existingTorrent.ready) return resolve(existingTorrent);
+      const timer = setTimeout(() => reject(new Error('Timeout')), timeoutMs);
+      existingTorrent.once('ready', () => { clearTimeout(timer); resolve(existingTorrent); });
+      existingTorrent.once('error', (err) => { clearTimeout(timer); reject(err); });
       return;
     }
 
-    const torrent = client.add(source, { destroyStoreOnDestroy: true }, (t) => onTorrent(t));
-    torrent.on('error', (err) => {
-      if (err.message?.includes('Cannot add duplicate')) {
-        const dup = client.torrents.find(t => t.infoHash === existing) || client.torrents[client.torrents.length - 1];
+    const timer = setTimeout(() => {
+      reject(new Error('Could not get torrent metadata. No seeders found or DHT-only torrent.'));
+    }, timeoutMs);
+
+    let torrent;
+    try {
+      torrent = client.add(source, {
+        destroyStoreOnDestroy: true,
+        announce: [
+          'wss://tracker.openwebtorrent.com',
+          'wss://tracker.btorrent.xyz',
+          'wss://tracker.fastcast.nz'
+        ]
+      });
+      torrent._addedAt = Date.now();
+    } catch (err) {
+      clearTimeout(timer);
+      return reject(err);
+    }
+
+    torrent.once('ready', () => { clearTimeout(timer); resolve(torrent); });
+
+    torrent.once('error', (err) => {
+      clearTimeout(timer);
+      if (err.message?.includes('Cannot add duplicate') || err.message?.includes('already in client')) {
+        const dup = client.torrents.find(t => t.infoHash === torrent.infoHash && !t.destroyed);
         if (dup) {
-          if (dup.ready) onTorrent(dup);
-          else dup.once('ready', () => onTorrent(dup));
+          if (dup.ready) return resolve(dup);
+          const t2 = setTimeout(() => reject(new Error('Timeout')), timeoutMs);
+          dup.once('ready', () => { clearTimeout(t2); resolve(dup); });
+          dup.once('error', (e) => { clearTimeout(t2); reject(e); });
           return;
         }
       }
-      onError?.(err);
+      reject(err);
     });
-  } catch (err) {
-    onError?.(err);
-  }
+  });
 }
 
 export function handleWsTorrentUpgrade(wss, req, socket, head) {
   const ws = wss.handleUpgrade(req, socket, head);
-  
-  // 60 minute timeout for finding peers + downloading
+  let closed = false;
+
   const timeout = setTimeout(() => {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: 'error', message: 'Timed out.' }));
+    if (!closed && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Timed out waiting for peers.' }));
       ws.close();
     }
-  }, 60 * 60 * 1000);
+  }, 90 * 60 * 1000);
 
-  ws.on('close', () => clearTimeout(timeout));
+  const safeSend = (data) => {
+    if (!closed && ws.readyState === ws.OPEN) ws.send(data);
+  };
 
-  ws.on('message', (rawMsg) => {
+  const safeClose = () => {
+    if (!closed) {
+      closed = true;
+      clearTimeout(timeout);
+      try { ws.close(); } catch {}
+    }
+  };
+
+  ws.on('close', () => { closed = true; clearTimeout(timeout); });
+
+  ws.on('message', async (rawMsg) => {
     let msg;
     try { msg = JSON.parse(rawMsg); } catch { return; }
 
-    if (msg.type === 'start') {
-      const source = msg.magnet;
-      const fileIndex = msg.fileIndex !== undefined ? parseInt(msg.fileIndex, 10) : null;
+    if (msg.type !== 'start') return;
 
-      if (!isValidTorrentSource(source)) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid magnet or URL' }));
-        ws.close();
-        return;
+    const source = msg.magnet;
+    const fileIndex = msg.fileIndex !== undefined ? parseInt(msg.fileIndex, 10) : null;
+
+    if (!isValidSource(source)) {
+      safeSend(JSON.stringify({ type: 'error', message: 'Invalid magnet or URL' }));
+      safeClose();
+      return;
+    }
+
+    try {
+      const torrent = await getTorrent(source);
+
+      let targetFile;
+      if (fileIndex !== null && torrent.files[fileIndex]) {
+        targetFile = torrent.files[fileIndex];
+      } else if (torrent.files.length === 1) {
+        targetFile = torrent.files[0];
       }
 
-      getOrAdd(
-        source,
-        (torrent) => {
-          let targetFile;
-          if (fileIndex !== null && torrent.files[fileIndex]) {
-            targetFile = torrent.files[fileIndex];
-          } else if (torrent.files.length === 1) {
-            targetFile = torrent.files[0];
+      if (targetFile) {
+        safeSend(JSON.stringify({ type: 'meta', name: targetFile.name, size: targetFile.length }));
+        const stream = targetFile.createReadStream();
+
+        stream.on('data', (chunk) => {
+          if (closed) return stream.destroy();
+          if (ws.bufferedAmount > 4 * 1024 * 1024) {
+            stream.pause();
+            const onDrain = () => { stream.resume(); ws.removeListener('drain', onDrain); };
+            ws.on('drain', onDrain);
           }
+          safeSend(chunk);
+        });
 
-          if (!targetFile) {
-            return streamAsZip(ws, torrent, timeout);
-          }
+        stream.on('end', () => { safeSend(JSON.stringify({ type: 'done' })); safeClose(); });
+        stream.on('error', (err) => { safeSend(JSON.stringify({ type: 'error', message: 'Stream error: ' + err.message })); safeClose(); });
 
-          // Tell the browser the file name and total size so it can show progress
-          ws.send(JSON.stringify({ 
-            type: 'meta', 
-            name: targetFile.name, 
-            size: targetFile.length 
-          }));
+      } else {
+        const { default: archiver } = await import('archiver');
+        safeSend(JSON.stringify({ type: 'meta', name: torrent.name + '.zip', size: torrent.length }));
 
-          // Stream chunks directly to the browser
-          const stream = targetFile.createReadStream();
-          
-          stream.on('data', (chunk) => {
-            // Backpressure: pause if the browser/network is falling behind
-            if (ws.bufferedAmount > 2 * 1024 * 1024) {
-              stream.pause();
-              ws.once('drain', () => stream.resume());
-            }
-            ws.send(chunk);
-          });
+        const archive = archiver('zip', { zlib: { level: 1 } });
+        archive.on('error', (err) => { safeSend(JSON.stringify({ type: 'error', message: 'Zip error: ' + err.message })); safeClose(); });
 
-          stream.on('end', () => {
-            ws.send(JSON.stringify({ type: 'done' }));
-            clearTimeout(timeout);
-            torrent.destroy();
-          });
-
-          stream.on('error', (err) => {
-            ws.send(JSON.stringify({ type: 'error', message: 'Stream error: ' + err.message }));
-            clearTimeout(timeout);
-            ws.close();
-          });
-        },
-        (err) => {
-          ws.send(JSON.stringify({ type: 'error', message: err.message || 'Failed to resolve torrent.' }));
-          clearTimeout(timeout);
-          ws.close();
+        for (const file of torrent.files) {
+          archive.append(file.createReadStream(), { name: file.path });
         }
-      );
+
+        archive.on('data', (chunk) => {
+          if (closed) return archive.destroy();
+          if (ws.bufferedAmount > 4 * 1024 * 1024) {
+            archive.pause();
+            const onDrain = () => { archive.resume(); ws.removeListener('drain', onDrain); };
+            ws.on('drain', onDrain);
+          }
+          safeSend(chunk);
+        });
+
+        archive.on('end', () => { safeSend(JSON.stringify({ type: 'done' })); safeClose(); });
+        archive.finalize();
+      }
+    } catch (err) {
+      safeSend(JSON.stringify({ type: 'error', message: err.message || 'Failed to resolve torrent.' }));
+      safeClose();
     }
   });
-}
-
-function streamAsZip(ws, torrent, timeout) {
-  ws.send(JSON.stringify({ 
-    type: 'meta', 
-    name: `${torrent.name}.zip`, 
-    size: torrent.length 
-  }));
-
-  const archive = archiver('zip', { zlib: { level: 1 } }); // Level 1 for speed
-  archive.on('error', (err) => {
-    ws.send(JSON.stringify({ type: 'error', message: 'Zip error: ' + err.message }));
-    clearTimeout(timeout);
-    ws.close();
-  });
-
-  for (const file of torrent.files) {
-    archive.append(file.createReadStream(), { name: file.path });
-  }
-
-  archive.on('data', (chunk) => {
-    if (ws.bufferedAmount > 2 * 1024 * 1024) {
-      archive.pause();
-      ws.once('drain', () => archive.resume());
-    }
-    ws.send(chunk);
-  });
-
-  archive.on('end', () => {
-    ws.send(JSON.stringify({ type: 'done' }));
-    clearTimeout(timeout);
-    torrent.destroy();
-  });
-
-  archive.finalize();
 }

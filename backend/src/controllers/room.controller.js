@@ -6,8 +6,6 @@ function getConfig(req, res) {
 }
 
 // GET /api/rooms/:roomId
-// Used when someone opens the shared link, before the socket connection is made,
-// so the frontend can show "this room expired" instead of attempting to join.
 function getRoom(req, res) {
   const roomManager = req.app.locals.roomManager;
   const room = roomManager.getRoom(req.params.roomId);

@@ -1,204 +1,149 @@
-import { createRequire } from 'module';
 import client from '../utils/torrentClient.js';
 
-const require = createRequire(import.meta.url);
-const archiver = require('archiver');
-
-const ADD_TIMEOUT_MS = 30_000;
-
-const isValidTorrentSource = (source) => {
-  if (!source || typeof source !== 'string') return false;
-  const trimmed = source.trim();
-  return trimmed.startsWith('magnet:') || trimmed.startsWith('http://') || trimmed.startsWith('https://');
+const isValidSource = (s) => {
+  if (!s || typeof s !== 'string') return false;
+  const t = s.trim();
+  return t.startsWith('magnet:') || t.startsWith('http://') || t.startsWith('https://');
 };
 
-function getOrAdd(source, onTorrent, onError) {
-  try {
-    // 1. Check if WebTorrent already knows about this torrent.
-    // client.get() can return a Torrent object OR just an infoHash string
-    // depending on the WebTorrent version, so we handle both.
+function getTorrent(source, timeoutMs = 45000) {
+  return new Promise((resolve, reject) => {
     const existing = client.get(source);
-    let existingTorrent = null;
 
-    if (existing) {
-      if (typeof existing === 'object' && typeof existing.once === 'function') {
-        // It's a valid torrent object
-        existingTorrent = existing;
-      } else if (typeof existing === 'string') {
-        // It's just the infoHash string — find the actual object in the client's list
-        existingTorrent = client.torrents.find(t => t.infoHash === existing) || null;
-      }
+    // client.get() can return a string (infoHash) or a Torrent object
+    let existingTorrent = null;
+    if (existing && typeof existing === 'object' && !existing.destroyed) {
+      existingTorrent = existing;
+    } else if (typeof existing === 'string') {
+      existingTorrent = client.torrents.find(t => t.infoHash === existing && !t.destroyed) || null;
     }
 
     if (existingTorrent) {
-      if (existingTorrent.ready) {
-        onTorrent(existingTorrent);
-      } else {
-        existingTorrent.once('ready', () => onTorrent(existingTorrent));
-        existingTorrent.once('error', (err) => {
-          console.error('[getOrAdd existing error]', err.message);
-          onError?.(err);
-        });
-      }
-      return; // Stop here, we found it!
+      if (existingTorrent.ready) return resolve(existingTorrent);
+      const timer = setTimeout(() => reject(new Error('Timeout waiting for torrent to ready')), timeoutMs);
+      existingTorrent.once('ready', () => { clearTimeout(timer); resolve(existingTorrent); });
+      existingTorrent.once('error', (err) => { clearTimeout(timer); reject(err); });
+      return;
     }
 
-    // 2. If not found, add it
-    const torrent = client.add(source, { destroyStoreOnDestroy: true }, (t) => {
-      onTorrent(t);
-    });
+    const timer = setTimeout(() => {
+      reject(new Error('Could not get torrent metadata. The torrent may have no seeders, or uses DHT-only discovery (disabled on this server).'));
+    }, timeoutMs);
 
-    // 3. Catch errors that happen DURING handshake
-    torrent.on('error', (err) => {
-      // If it failed because it was actually added in a race condition,
-      // try to recover by finding it in the client's active list.
-      if (err.message && err.message.includes('Cannot add duplicate')) {
-        console.log('[getOrAdd] Recovering from duplicate add...');
-        const dup = client.torrents.find(t => t.infoHash === existing) || client.torrents[client.torrents.length - 1];
+    let torrent;
+    try {
+      torrent = client.add(source, {
+        destroyStoreOnDestroy: true,
+        announce: [
+          'wss://tracker.openwebtorrent.com',
+          'wss://tracker.btorrent.xyz',
+          'wss://tracker.fastcast.nz'
+        ]
+      });
+      torrent._addedAt = Date.now();
+    } catch (err) {
+      clearTimeout(timer);
+      return reject(err);
+    }
+
+    torrent.once('ready', () => { clearTimeout(timer); resolve(torrent); });
+
+    torrent.once('error', (err) => {
+      clearTimeout(timer);
+      if (err.message?.includes('Cannot add duplicate') || err.message?.includes('already in client')) {
+        const dup = client.torrents.find(t => t.infoHash === torrent.infoHash && !t.destroyed);
         if (dup) {
-          if (dup.ready) onTorrent(dup);
-          else dup.once('ready', () => onTorrent(dup));
+          if (dup.ready) return resolve(dup);
+          const t2 = setTimeout(() => reject(new Error('Timeout waiting for duplicate torrent')), timeoutMs);
+          dup.once('ready', () => { clearTimeout(t2); resolve(dup); });
+          dup.once('error', (e) => { clearTimeout(t2); reject(e); });
           return;
         }
       }
-      console.error('[getOrAdd new error]', err.message);
-      onError?.(err);
+      reject(err);
     });
-
-  } catch (err) {
-    console.error('[getOrAdd sync throw]', err.message);
-    onError?.(err);
-  }
+  });
 }
 
-// Helper to safely send a response exactly once
-const safeResponse = (res, settledRef, timeoutRef) => ({
-  success: (data) => {
-    if (settledRef.current) return;
-    settledRef.current = true;
-    clearTimeout(timeoutRef.current);
-    res.json(data);
-  },
-  error: (code, msg) => {
-    if (settledRef.current) return;
-    settledRef.current = true;
-    clearTimeout(timeoutRef.current);
-    res.status(code).json({ ok: false, error: msg });
-  }
-});
-
-// GET /api/torrent/info?magnet=<uri_or_url>
-export function getInfo(req, res) {
-  let source = req.query.magnet;
-  if (Array.isArray(source)) source = source[0];
-
-  if (!isValidTorrentSource(source)) {
-    return res.status(400).json({ ok: false, error: 'Valid magnet link or .torrent URL required' });
-  }
-
-  const settled = { current: false };
-  const timeout = { current: setTimeout(() => {
-    safeResponse(res, settled, timeout).error(504, 'Timed out resolving torrent. If using a magnet link, your server might block WebTorrent traffic (common on Render free tier). Try a .torrent URL instead.');
-  }, ADD_TIMEOUT_MS) };
-
-  const { success, error } = safeResponse(res, settled, timeout);
-
-  getOrAdd(
-    source,
-    (torrent) => {
-      if (!torrent.files || torrent.files.length === 0) {
-        return error(500, 'Torrent resolved but contains no files.');
-      }
-      success({
-        ok: true,
-        name: torrent.name,
-        infoHash: torrent.infoHash,
-        totalSize: torrent.length,
-        files: torrent.files.map((f, i) => ({ index: i, name: f.name, size: f.length })),
-      });
-    },
-    (err) => {
-      let message = 'Failed to resolve torrent.';
-      if (err?.message?.includes('UDP') || err?.message?.includes('EADDRINUSE') || err?.message?.includes('network')) {
-        message = 'Server network restrictions (common on Render free tier) are blocking WebTorrent. Try using a direct .torrent URL instead of a magnet link.';
-      } else if (err?.message?.includes('timed out') || err?.message?.includes('tracker')) {
-        message = 'Could not connect to trackers. The torrent might be dead.';
-      }
-      error(500, message);
+export const getInfo = async (req, res, next) => {
+  try {
+    const { magnet } = req.query;
+    if (!isValidSource(magnet)) {
+      return res.status(400).json({ ok: false, error: 'Invalid magnet link or URL' });
     }
-  );
-}
 
-// GET /api/torrent/download?magnet=<uri_or_url>&fileIndex=<n>
-export function download(req, res) {
-  let source = req.query.magnet;
-  if (Array.isArray(source)) source = source[0];
-  const fileIndex = req.query.fileIndex !== undefined ? parseInt(req.query.fileIndex, 10) : null;
+    const torrent = await getTorrent(magnet);
 
-  if (!isValidTorrentSource(source)) {
-    return res.status(400).json({ ok: false, error: 'Valid magnet link or .torrent URL required' });
+    res.json({
+      ok: true,
+      name: torrent.name,
+      infoHash: torrent.infoHash,
+      totalSize: torrent.length,
+      files: torrent.files.map((f, i) => ({
+        index: i,
+        name: f.name,
+        size: f.length,
+        path: f.path
+      }))
+    });
+  } catch (err) {
+    next(err);
   }
+};
 
-  const settled = { current: false };
-  const timeout = { current: setTimeout(() => {
-    safeResponse(res, settled, timeout).error(504, 'Timed out finding peers for this torrent.');
-  }, ADD_TIMEOUT_MS) };
+export const download = async (req, res, next) => {
+  try {
+    const { magnet, fileIndex } = req.query;
+    if (!isValidSource(magnet)) {
+      return res.status(400).json({ ok: false, error: 'Invalid magnet link or URL' });
+    }
 
-  const { success, error } = safeResponse(res, settled, timeout);
+    const idx = fileIndex !== undefined ? parseInt(fileIndex, 10) : null;
+    const torrent = await getTorrent(magnet, 120000);
 
-  getOrAdd(
-    source,
-    (torrent) => {
-      let targetFile;
-      if (fileIndex !== null && torrent.files[fileIndex]) {
-        targetFile = torrent.files[fileIndex];
-      } else if (torrent.files.length === 1) {
-        targetFile = torrent.files[0];
-      } else {
-        return streamAsZip(torrent, res);
-      }
+    let targetFile;
+    if (idx !== null && torrent.files[idx]) {
+      targetFile = torrent.files[idx];
+    } else if (torrent.files.length === 1) {
+      targetFile = torrent.files[0];
+    }
 
-      res.setHeader('Content-Disposition', `attachment; filename="${sanitize(targetFile.name)}"`);
-      res.setHeader('Content-Length', targetFile.length);
+    if (targetFile) {
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(targetFile.name)}`);
       res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Length', targetFile.length);
 
       const stream = targetFile.createReadStream();
       stream.pipe(res);
 
-      stream.on('error', () => {
-        if (!res.headersSent) res.status(500).json({ ok: false, error: 'stream error' });
+      stream.on('error', (err) => {
+        console.error('[Download stream error]', err.message);
+        if (!res.headersSent) res.status(500).end();
+        else res.end();
       });
 
-      const cleanup = () => torrent.destroy();
-      stream.on('end', cleanup);
-      req.on('close', cleanup);
-    },
-    (err) => {
-      error(500, `Failed to start download: ${err?.message || 'Unknown error'}`);
+      res.on('close', () => stream.destroy());
+    } else {
+      const { default: archiver } = await import('archiver');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(torrent.name + '.zip')}`);
+      res.setHeader('Content-Type', 'application/zip');
+
+      const archive = archiver('zip', { zlib: { level: 1 } });
+      archive.pipe(res);
+
+      for (const file of torrent.files) {
+        archive.append(file.createReadStream(), { name: file.path });
+      }
+
+      archive.finalize();
+
+      archive.on('error', (err) => {
+        console.error('[Zip error]', err.message);
+        if (!res.headersSent) res.status(500).end();
+        else res.end();
+      });
     }
-  );
-}
-
-function streamAsZip(torrent, res) {
-  res.setHeader('Content-Disposition', `attachment; filename="${sanitize(torrent.name)}.zip"`);
-  res.setHeader('Content-Type', 'application/zip');
-
-  const archive = archiver('zip', { zlib: { level: 6 } });
-  archive.on('error', () => {
-    if (!res.headersSent) res.status(500).end();
-  });
-  archive.pipe(res);
-
-  for (const file of torrent.files) {
-    archive.append(file.createReadStream(), { name: file.path });
+  } catch (err) {
+    next(err);
   }
-  archive.finalize();
-
-  const cleanup = () => torrent.destroy();
-  archive.on('end', cleanup);
-  res.on('close', cleanup);
-}
-
-function sanitize(name) {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_');
-}
+};

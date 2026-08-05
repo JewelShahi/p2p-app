@@ -3,13 +3,13 @@ import cors from 'cors';
 import helmet from 'helmet';
 import http from 'http';
 import { Server } from 'socket.io';
-import { WebSocketServer } from 'ws'; // NEW: Raw WebSocket for torrent streaming
+import { WebSocketServer } from 'ws'; 
 
 import { RoomManager } from './utils/roomManager.js';
 import { registerSignaling } from './utils/signaling.js';
 import routes from './routes/routes.js';
 import torrentRoutes from './routes/torrent.route.js';
-import { handleWsTorrentUpgrade } from './controllers/ws-torrent.controller.js'; // NEW: WS handler
+import { handleWsTorrentUpgrade } from './controllers/ws-torrent.controller.js'; 
 import errorHandler from './middlewares/errorHandler.middleware.js';
 import { apiLimiter } from './middlewares/rateLimiter.middleware.js';
 import dotenv from 'dotenv';
@@ -21,7 +21,6 @@ const PORT = process.env.PORT || 4000;
 const app = express();
 
 // 1. Tell Express to trust reverse proxy headers (Cloudflare, Nginx, AWS)
-// Needed so req.ip is accurate in rate limiters
 app.set('trust proxy', 1);
 
 // 2. Prevent accidental '*' wildcard CORS fallbacks in production environments
@@ -38,8 +37,6 @@ app.use(cors({ origin: allowedOrigin, credentials: true }));
 
 app.use(
   helmet({
-    // Default CORP (same-origin) blocks file streaming/zip downloads when the
-    // frontend is on a different origin than this API — relax just that part.
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
@@ -63,7 +60,6 @@ const io = new Server(server, {
 });
 
 // RoomManager needs `io` to broadcast (room-closed, etc.), so it's built here
-// and shared with REST controllers via app.locals rather than each requiring its own instance.
 const roomManager = new RoomManager(io);
 app.locals.roomManager = roomManager;
 
@@ -83,12 +79,10 @@ app.get('/', (req, res) => {
 app.use(errorHandler);
 
 // ====================================================================================
-// NEW: WEBSOCKET STREAMING FOR TORRENTS (DOES NOT INTERFERE WITH SOCKET.IO/P2P)
+// WEBSOCKET STREAMING FOR TORRENTS (DOES NOT INTERFERE WITH SOCKET.IO/P2P)
 // ====================================================================================
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  // Only intercept the exact path our React app will call.
-  // Socket.io handles its own paths automatically, so we ignore everything else.
   if (req.url === '/ws-download') {
     handleWsTorrentUpgrade(wss, req, socket, head);
   }
