@@ -1,11 +1,14 @@
-// roomManager.js — no changes needed from previous version, included for completeness
+// roomManager.js
 import { v4 as uuidv4 } from 'uuid';
 
 const MIN_DURATION = 10;
 const MAX_DURATION = 60;
 const STEP = 5;
 const DEFAULT_DURATION = 20;
-const DISCONNECT_GRACE_MS = 5 * 60 * 1000;
+
+// FIX (mobile): 2 min is plenty for a phone opening the gallery, and short
+// enough to clean up genuinely-gone peers. 5 min left ghosts around too long.
+const DISCONNECT_GRACE_MS = 2 * 60 * 1000;
 
 const isValidDuration = (minutes) => {
   if (typeof minutes !== 'number') return false;
@@ -81,6 +84,31 @@ class RoomManager {
     return removed;
   }
 
+  // FIX (ghost users): remove every stale entry for this user EXCEPT the
+  // socket that is (re)joining right now. Prevents the reconnect race where
+  // the old socket's later disconnect wipes the fresh member.
+  removeStaleUserSockets(roomId, userId, keepSocketId) {
+    const room = this.getRoom(roomId);
+    if (!room) return;
+    for (const [sid, member] of room.members.entries()) {
+      if (member.userId === userId && sid !== keepSocketId) {
+        room.members.delete(sid);
+      }
+    }
+  }
+
+  // True if this user has at least one socket that is currently connected.
+  hasLiveSocketForUser(roomId, userId) {
+    const room = this.getRoom(roomId);
+    if (!room) return false;
+    for (const member of room.members.values()) {
+      if (member.userId === userId && this.io.sockets.sockets.has(member.socketId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   extendOrSetOffer(roomId, offer) {
     const room = this.getRoom(roomId);
     if (!room) return null;
@@ -91,9 +119,14 @@ class RoomManager {
   getLiveMembers(roomId) {
     const room = this.getRoom(roomId);
     if (!room) return [];
-    return Array.from(room.members.values())
-      .filter((m) => this.io.sockets.sockets.has(m.socketId))
-      .map((m) => ({ socketId: m.socketId, userId: m.userId }));
+    // Dedupe by userId so the host never sees the same person twice.
+    const byUser = new Map();
+    for (const m of room.members.values()) {
+      if (this.io.sockets.sockets.has(m.socketId)) {
+        byUser.set(m.userId, { socketId: m.socketId, userId: m.userId });
+      }
+    }
+    return Array.from(byUser.values());
   }
 
   scheduleHostDisconnect(roomId, graceMs = DISCONNECT_GRACE_MS) {
@@ -122,6 +155,12 @@ class RoomManager {
 
     const timer = setTimeout(() => {
       room.pendingLeaves.delete(userId);
+
+      // ── THE RACE FIX ──
+      // If the user already reconnected on a newer socket, do NOT remove them
+      // and do NOT tell the host they left.
+      if (this.hasLiveSocketForUser(roomId, userId)) return;
+
       this.removeMemberByUserId(roomId, userId);
       this.io.to(room.hostSocketId).emit('peer-left', {
         peerSocketId: socketId,

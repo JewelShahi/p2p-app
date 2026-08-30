@@ -15,17 +15,14 @@ export function registerSignaling(io, roomManager) {
       const durationMinutes = isValidDuration(payload?.durationMinutes)
         ? payload.durationMinutes
         : DEFAULT_DURATION;
-
       const room = roomManager.createRoom({
         hostSocketId: socket.id,
         durationMinutes,
       });
-
       socket.join(room.id);
       socket.data.roomId = room.id;
       socket.data.isHost = true;
       socket.data.userId = room.hostUserId;
-
       ack?.({
         ok: true,
         roomId: room.id,
@@ -39,18 +36,15 @@ export function registerSignaling(io, roomManager) {
     socket.on('join-room', (payload, ack) => {
       const { roomId } = payload || {};
       const room = roomManager.getRoom(roomId);
-
       if (!roomManager.isJoinable(room)) {
         ack?.({ ok: false, error: room ? 'room-expired-or-closed' : 'room-not-found' });
         return;
       }
-
       const member = roomManager.addMember(roomId, socket.id);
       socket.join(roomId);
       socket.data.roomId = roomId;
       socket.data.isHost = false;
       socket.data.userId = member.userId;
-
       ack?.({
         ok: true,
         roomId,
@@ -59,7 +53,6 @@ export function registerSignaling(io, roomManager) {
         remainingSeconds: roomManager.remainingSeconds(roomId),
         currentOffer: room.currentOffer,
       });
-
       io.to(room.hostSocketId).emit('peer-joined', {
         peerSocketId: socket.id,
         peerUserId: member.userId,
@@ -71,7 +64,6 @@ export function registerSignaling(io, roomManager) {
     socket.on('rejoin-room', (payload, ack) => {
       const { roomId, userId } = payload || {};
       const room = roomManager.getRoom(roomId);
-
       if (!room) {
         ack?.({ ok: false, error: 'room-not-found' });
         return;
@@ -95,19 +87,20 @@ export function registerSignaling(io, roomManager) {
         room.hostSocketId = socket.id;
         roomManager.cancelHostDisconnect(roomId);
       } else {
-        // Remove ALL old entries for this userId before adding the new one
-        roomManager.removeMemberByUserId(roomId, userId);
+        // FIX (ghost users): cancel any pending leave FIRST, then drop only the
+        // OLD sockets for this user, keeping the fresh one we're adding now.
+        roomManager.cancelPeerDisconnect(roomId, userId);
+        roomManager.removeStaleUserSockets(roomId, userId, socket.id);
         room.members.set(socket.id, {
           socketId: socket.id,
           userId,
           joinedAt: Date.now(),
           downloading: new Set(),
         });
-        roomManager.cancelPeerDisconnect(roomId, userId);
       }
 
-      // Emit peer-reconnected BEFORE the ack so peers destroy their old
-      // host connection BEFORE the host starts sending new signals.
+      // Emit peer-reconnected BEFORE the ack so peers tear down the old host
+      // connection before the host starts sending new signals.
       socket.to(roomId).emit('peer-reconnected', {
         userId,
         isHost: wasHost,
@@ -129,13 +122,10 @@ export function registerSignaling(io, roomManager) {
     socket.on('signal', (payload) => {
       const { targetSocketId, signal } = payload || {};
       if (!targetSocketId || !signal) return;
-
       const senderRoomId = socket.data.roomId;
       if (!senderRoomId) return;
-
       const targetSocket = io.sockets.sockets.get(targetSocketId);
       if (!targetSocket || targetSocket.data.roomId !== senderRoomId) return;
-
       io.to(targetSocketId).emit('signal', {
         fromSocketId: socket.id,
         signal,
@@ -147,7 +137,6 @@ export function registerSignaling(io, roomManager) {
       const roomId = socket.data.roomId;
       const room = roomManager.getRoom(roomId);
       if (!room || socket.data.userId !== room.hostUserId) return;
-
       const totalSize = payload?.totalSize || 0;
       if (totalSize > MAX_UPLOAD_BYTES) {
         socket.emit('file-offer-error', {
@@ -157,11 +146,13 @@ export function registerSignaling(io, roomManager) {
         });
         return;
       }
-
+      const files = Array.isArray(payload?.files) ? payload.files : [];
       const offer = {
         offerId: uuidv4(),
-        files: Array.isArray(payload?.files) ? payload.files : [],
-        totalSize: payload?.totalSize || 0,
+        files,
+        totalSize,
+        // FIX (always-zip): tell receivers to zip when more than one file.
+        forceZip: files.length > 1,
         createdAt: Date.now(),
       };
       roomManager.extendOrSetOffer(roomId, offer);
@@ -173,7 +164,6 @@ export function registerSignaling(io, roomManager) {
       const { accept, mode, offerId } = payload || {};
       const room = roomManager.getRoom(socket.data.roomId);
       if (!room) return;
-
       io.to(room.hostSocketId).emit('file-response', {
         fromSocketId: socket.id,
         fromUserId: socket.data.userId,
@@ -196,15 +186,10 @@ export function registerSignaling(io, roomManager) {
     });
 
     // ---------- HOST TERMINATES ROOM ----------
-    // Accepts roomId + userId in the payload so it works even right after
-    // a reconnect, before rejoin-room has populated socket.data. Without
-    // this, terminate fails with "room-not-found" because socket.data.roomId
-    // is null on the fresh server-side socket.
     socket.on('terminate-room', (payload, ack) => {
       const roomId = payload?.roomId || socket.data.roomId;
       const userId = payload?.userId || socket.data.userId;
       const room = roomManager.getRoom(roomId);
-
       if (!room) {
         ack?.({ ok: false, error: 'room-not-found' });
         return;
@@ -228,10 +213,12 @@ export function registerSignaling(io, roomManager) {
       if (!roomId) return;
       const room = roomManager.getRoom(roomId);
       if (!room) return;
-
       if (socket.data.isHost) {
-        roomManager.scheduleHostDisconnect(roomId);
-        socket.to(roomId).emit('peer-disconnected-temporarily', { isHost: true });
+        // Only schedule host teardown if THIS socket is still the active host.
+        if (room.hostSocketId === socket.id) {
+          roomManager.scheduleHostDisconnect(roomId);
+          socket.to(roomId).emit('peer-disconnected-temporarily', { isHost: true });
+        }
       } else {
         roomManager.schedulePeerDisconnect(roomId, socket.id, socket.data.userId);
         io.to(room.hostSocketId).emit('peer-disconnected-temporarily', {
@@ -249,7 +236,6 @@ function handleLeave(socket, io, roomManager, { disconnected = false } = {}) {
   if (!roomId) return;
   const room = roomManager.getRoom(roomId);
   if (!room) return;
-
   if (socket.data.isHost) {
     roomManager.closeRoom(roomId, disconnected ? 'host-disconnected' : 'terminated');
   } else {
