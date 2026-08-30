@@ -128,12 +128,16 @@ async function makeDiskWriter(fileName, totalSize) {
 }
 
 // ── Public API: add a torrent and get its info (no download yet) ──
+// clientTorrent.js (excerpt for addTorrent)
+
 export function addTorrent(source, { timeoutMs = 60000 } = {}) {
   return new Promise((resolve, reject) => {
     const client = getClient();
 
     const existing = client.get(source);
-    if (existing && !existing.destroyed) {
+    
+    // Check if existing is a valid WebTorrent instance with an active .once listener
+    if (existing && typeof existing === 'object' && typeof existing.once === 'function' && !existing.destroyed) {
       if (existing.ready) return resolve(existing);
       existing.once('ready', () => resolve(existing));
       existing.once('error', reject);
@@ -141,7 +145,7 @@ export function addTorrent(source, { timeoutMs = 60000 } = {}) {
     }
 
     const timer = setTimeout(() => {
-      reject(new Error('No peers found in time. In-browser torrents can only use WebRTC/WSS peers and web seeds — this torrent may not have any.'));
+      reject(new Error('No peers found in time. Ensure your Python seeder script or WebTorrent Desktop is active and seeding.'));
     }, timeoutMs);
 
     let torrent;
