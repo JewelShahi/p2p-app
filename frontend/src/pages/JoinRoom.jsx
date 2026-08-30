@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import { Users, LogOut, Wifi, Clock, ArrowDownToLine, CheckCircle2 } from 'lucide-react';
-import socket from '../api/socket';
+import socket, { wireVisibilityReconnect } from '../api/socket';
 import CountdownTimer from '../components/CountdownTimer';
 import FileOfferModal from '../components/FileOfferModal';
 import TransferProgress from '../components/TransferProgress';
@@ -26,6 +26,7 @@ export default function JoinRoom() {
   const hasReceivedData = useRef(false);
   const isReceivingRef = useRef(false);
   const lastOfferIdRef = useRef(null);
+  const transferDoneRef = useRef(false); // true ONLY when integrity-checked done
 
   const downloadStateRef = useRef('idle');
   useEffect(() => { downloadStateRef.current = downloadState; }, [downloadState]);
@@ -48,47 +49,37 @@ export default function JoinRoom() {
       setProgress(null);
       hasReceivedData.current = false;
       isReceivingRef.current = false;
+      transferDoneRef.current = false;
     };
 
     const handleDownloadComplete = () => {
       if (downloadStateRef.current === 'complete') return;
-
       if (downloadCallbacks.current?.stallTimer) {
         clearTimeout(downloadCallbacks.current.stallTimer);
         downloadCallbacks.current = null;
       }
+      transferDoneRef.current = true;
       setProgress(1);
       setDownloadState('complete');
       hasReceivedData.current = false;
       isReceivingRef.current = false;
-
-      // Do NOT destroy the peer. Keeping it alive means:
-      // - No need to recreate it for the 2nd/3rd batch
-      // - No race conditions with listener attachment
-      // - No waitingForPeerRef/pendingDownloadConfig complexity
-      // - The old channel listener is cleaned up by receiveFiles itself
     };
 
     const startReceiveFiles = (mode, fileHandles) => {
       if (!hostPeer.current) {
-        console.error('[startReceiveFiles] no peer');
         clearDownloadState();
         toast.error('Connection lost unexpectedly', { id: 'no-peer-receive' });
         return;
       }
+      transferDoneRef.current = false;
 
       const stallTimer = setTimeout(() => {
-        if (!hasReceivedData.current) {
-          toast.error('Download stalled — connection may have dropped', { id: 'download-stalled' });
-          clearDownloadState();
-        } else {
-          handleDownloadComplete();
-        }
+        // FIX (corruption): a stall is NOT a success. Never mark complete here.
+        toast.error('Download stalled — please ask the host to re-send', { id: 'download-stalled' });
+        clearDownloadState();
       }, 30000);
 
       downloadCallbacks.current = { stallTimer };
-
-      console.log('[startReceiveFiles] calling receiveFiles, peer.connected =', hostPeer.current.connected);
 
       receiveFiles({
         peer: hostPeer.current,
@@ -115,22 +106,20 @@ export default function JoinRoom() {
           }
           cleanupReceiveListener();
           isReceivingRef.current = false;
-          if (hasReceivedData.current) {
-            handleDownloadComplete();
-            toast.success('Files received', { id: 'files-received-fallback' });
-          } else {
-            toast.error('Something interrupted the download', { id: 'download-error' });
-            setDownloadState('idle');
-            setProgress(null);
-          }
+          // FIX (corruption): integrity errors must NOT fall back to "received".
+          const msg = err === 'incomplete-file' || err === 'incomplete-transfer'
+            ? 'The file arrived incomplete — please ask the host to re-send'
+            : 'Something interrupted the download — please try again';
+          toast.error(msg, { id: 'download-error' });
+          setDownloadState('idle');
+          setProgress(null);
         },
       });
     };
 
-    // ──── REJOIN ────
+    // ──── REJOIN (reuses the SAME identity — no ghosts) ────
     const tryRejoin = () => {
       if (!myUserId.current) return;
-
       const isFirstJoin = !hasJoinedOnce.current;
       if (!isFirstJoin) setIsReconnecting(true);
 
@@ -143,7 +132,6 @@ export default function JoinRoom() {
           navigate('/');
           return;
         }
-
         if (!isFirstJoin) toast.success('Back online', { id: 'rejoin-success' });
 
         if (res.currentOffer && res.currentOffer.offerId !== lastOfferIdRef.current) {
@@ -156,28 +144,32 @@ export default function JoinRoom() {
 
     socket.on('connect', tryRejoin);
 
-    if (socket.connected) {
-      tryRejoin();
+    // ──── FIX (ghost users): only ONE of rejoin OR fresh-join, never both. ────
+    if (myUserId.current) {
+      if (socket.connected) tryRejoin();
+      else socket.connect();
     } else {
-      socket.connect();
+      if (!socket.connected) socket.connect();
+      socket.emit('join-room', { roomId }, (res) => {
+        if (!res?.ok) {
+          toast.error(res?.error === 'room-not-found' ? 'That room does not exist' : 'That room has expired', { id: 'join-fail' });
+          navigate('/');
+          return;
+        }
+        myUserId.current = res.userId;
+        hasJoinedOnce.current = true;
+        sessionStorage.setItem(`peerUserId:${roomId}`, res.userId);
+        setExpiresAt(res.expiresAt);
+        if (res.currentOffer) {
+          setOffer(res.currentOffer);
+          lastOfferIdRef.current = res.currentOffer.offerId;
+        }
+        toast.success('Joined session', { id: 'join-success' });
+      });
     }
 
-    // ──── Initial join ────
-    socket.emit('join-room', { roomId }, (res) => {
-      if (!res?.ok) {
-        toast.error(res?.error === 'room-not-found' ? 'That room does not exist' : 'That room has expired', { id: 'join-fail' });
-        navigate('/');
-        return;
-      }
-      myUserId.current = res.userId;
-      sessionStorage.setItem(`peerUserId:${roomId}`, res.userId);
-      setExpiresAt(res.expiresAt);
-      if (res.currentOffer) {
-        setOffer(res.currentOffer);
-        lastOfferIdRef.current = res.currentOffer.offerId;
-      }
-      toast.success('Joined session', { id: 'join-success' });
-    });
+    // ──── MOBILE: reconnect instantly when the tab returns from the gallery ────
+    const unwireVisibility = wireVisibilityReconnect();
 
     // ──── WebRTC signaling ────
     socket.on('signal', ({ fromSocketId, signal }) => {
@@ -185,7 +177,6 @@ export default function JoinRoom() {
                                   hostSocketIdRef.current !== fromSocketId;
 
       if (hostPeer.current && isFromDifferentHost) {
-        console.log('[signal] from new host socketId', fromSocketId, '(was', hostSocketIdRef.current, ') — destroying old peer');
         cleanupReceiveListener();
         hostPeer.current.destroy();
         hostPeer.current = null;
@@ -193,7 +184,6 @@ export default function JoinRoom() {
 
       if (!hostPeer.current) {
         hostSocketIdRef.current = fromSocketId;
-
         hostPeer.current = createPeerConnection({
           initiator: false,
           socket,
@@ -203,10 +193,8 @@ export default function JoinRoom() {
             cleanupReceiveListener();
             hostPeer.current?.destroy();
             hostPeer.current = null;
-
             const attempts = hostRetryCount.current + 1;
             hostRetryCount.current = attempts;
-
             if (attempts > 3) {
               toast.error('Connection to host failed — try a different network', { id: 'host-fail-final' });
               return;
@@ -219,24 +207,22 @@ export default function JoinRoom() {
           toast.success('Direct connection established', { id: 'peer-connected' });
           hostRetryCount.current = 0;
         });
-
         hostPeer.current.on('error', (err) => {
           console.error('[peer error]', err);
           toast.error('Connection to host failed', { id: 'peer-error' });
         });
-
         hostPeer.current.on('iceStateChange', (iceState) => {
           console.log('[ICE state]', iceState);
         });
-
         hostPeer.current.on('close', () => {
-          console.log('[peer close]', {
-            downloadState: downloadStateRef.current,
-            hasReceivedData: hasReceivedData.current,
-          });
           cleanupReceiveListener();
-          if (downloadStateRef.current === 'downloading' && hasReceivedData.current) {
-            handleDownloadComplete();
+          // FIX (corruption): only the integrity-checked onDone marks complete.
+          // A close during download WITHOUT a real 'done' is an interruption.
+          if (downloadStateRef.current === 'downloading' && !transferDoneRef.current) {
+            isReceivingRef.current = false;
+            setDownloadState('idle');
+            setProgress(null);
+            toast.error('Connection dropped mid-transfer — please retry', { id: 'mid-drop' });
           }
           hostPeer.current = null;
         });
@@ -244,10 +230,15 @@ export default function JoinRoom() {
       hostPeer.current.signal(signal);
     });
 
+    // ──── FIX (mobile corruption): keep a LIVE channel; only rebuild a dead one ────
     socket.on('peer-reconnected', ({ isHost, socketId }) => {
       if (!isHost) return;
-      toast.success('Host reconnected', { id: 'host-reconnected' });
       hostSocketIdRef.current = socketId;
+
+      const alive = hostPeer.current && !hostPeer.current.destroyed && hostPeer.current.connected;
+      if (alive) return; // in-flight transfer keeps going
+
+      toast.success('Host reconnected', { id: 'host-reconnected' });
       cleanupReceiveListener();
       if (hostPeer.current) {
         hostPeer.current.destroy();
@@ -258,7 +249,6 @@ export default function JoinRoom() {
     socket.on('file-offer', (incomingOffer) => {
       if (incomingOffer.offerId === lastOfferIdRef.current) return;
       lastOfferIdRef.current = incomingOffer.offerId;
-
       clearDownloadState();
       toast.success('The host wants to send you files', { id: 'file-offer-toast' });
       setOffer(incomingOffer);
@@ -275,22 +265,27 @@ export default function JoinRoom() {
     });
 
     socket.on('disconnect', () => {
-      console.log('[socket disconnect] connection dropped, will auto-recover…');
+      console.log('[socket disconnect] will auto-recover…');
     });
 
     // ──── Respond implementation ────
     respondImplRef.current = async (accept, mode) => {
       const currentOffer = offerRef.current;
       if (!currentOffer) return;
-
       if (accept && isReceivingRef.current) {
         toast('Download already in progress', { icon: '⚠️', id: 'already-receiving' });
         return;
       }
 
+      // ──── FIX (always-zip): more than one file → force a single .zip ────
+      const effectiveMode = currentOffer.forceZip || (currentOffer.files?.length > 1)
+        ? 'zip'
+        : (mode || 'individual');
+
       let fileHandles = null;
 
-      if (accept && mode === 'individual' && 'showSaveFilePicker' in window) {
+      // Only the single-file path uses the native save picker.
+      if (accept && effectiveMode === 'individual' && 'showSaveFilePicker' in window) {
         fileHandles = new Map();
         try {
           for (const f of currentOffer.files) {
@@ -300,46 +295,31 @@ export default function JoinRoom() {
         } catch (err) {
           if (err?.name === 'AbortError') {
             toast.error('No save location selected — download cancelled', { id: 'save-cancelled' });
-            socket.emit('file-response', { accept: false, mode, offerId: currentOffer.offerId });
+            socket.emit('file-response', { accept: false, mode: effectiveMode, offerId: currentOffer.offerId });
             setOffer(null);
             lastOfferIdRef.current = null;
             return;
           }
-          console.warn('[respond] showSaveFilePicker unavailable, falling back to blob download', err);
-          fileHandles = null;
+          fileHandles = null; // fall back to blob download
         }
       }
 
-      socket.emit('file-response', { accept, mode, offerId: currentOffer.offerId });
+      socket.emit('file-response', { accept, mode: effectiveMode, offerId: currentOffer.offerId });
       setOffer(null);
       lastOfferIdRef.current = null;
-
       if (!accept) return;
 
       isReceivingRef.current = true;
+      transferDoneRef.current = false;
       setDownloadState('downloading');
       setProgress(0);
       hasReceivedData.current = false;
 
-      // ──── SIMPLIFIED: no more waitingForPeerRef/pendingDownloadConfig ────
-      // Since we keep the peer alive between batches, it should always be
-      // connected here. The only exception is if the peer died between
-      // the file-offer and the user clicking Download — extremely unlikely
-      // but handled by the error path.
       if (hostPeer.current && !hostPeer.current.destroyed && hostPeer.current.connected) {
-        console.log('[respond] peer is ready — receiving directly');
-        startReceiveFiles(mode, fileHandles);
+        startReceiveFiles(effectiveMode, fileHandles);
         return;
       }
 
-      // Peer is dead (shouldn't happen in normal flow since we don't
-      // destroy it). Show error and let the user try again when the host
-      // re-sends the offer (which would trigger a new peer-reconnected).
-      console.error('[respond] peer NOT ready', {
-        exists: !!hostPeer.current,
-        destroyed: hostPeer.current?.destroyed,
-        connected: hostPeer.current?.connected,
-      });
       toast.error('Connection to host was lost — please wait for the host to re-send', { id: 'peer-dead' });
       isReceivingRef.current = false;
       setDownloadState('idle');
@@ -354,6 +334,7 @@ export default function JoinRoom() {
       socket.off('room-closed');
       socket.off('connect_error');
       socket.off('disconnect');
+      unwireVisibility();
       if (downloadCallbacks.current?.stallTimer) {
         clearTimeout(downloadCallbacks.current.stallTimer);
       }
@@ -365,9 +346,7 @@ export default function JoinRoom() {
   }, [roomId]);
 
   const respond = async (accept, mode) => {
-    if (respondImplRef.current) {
-      return respondImplRef.current(accept, mode);
-    }
+    if (respondImplRef.current) return respondImplRef.current(accept, mode);
     toast.error('Not connected yet — please wait', { id: 'not-ready' });
   };
 
@@ -376,6 +355,8 @@ export default function JoinRoom() {
       toast.error('No connection — please wait', { id: 'leave-blocked' });
       return;
     }
+    // Clear identity so we don't auto-rejoin a room we intentionally left.
+    sessionStorage.removeItem(`peerUserId:${roomId}`);
     socket.emit('leave-room');
     toast('You left the session', { icon: '👋', id: 'left-session' });
     navigate('/');
@@ -493,8 +474,6 @@ export default function JoinRoom() {
 
         {/* Side Panel */}
         <div className="md:col-span-4 flex flex-col gap-4 lg:gap-5">
-
-          {/* Session Info */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50">
             <div className="card-body p-5 gap-4">
               <div className="flex items-center gap-3">
@@ -530,7 +509,6 @@ export default function JoinRoom() {
             </div>
           </div>
 
-          {/* Leave */}
           <div className="card bg-base-100 shadow-sm border border-base-300/50 flex-1">
             <div className="card-body p-5 justify-center gap-4">
               <div>

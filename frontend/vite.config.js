@@ -9,6 +9,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
     nodePolyfills({
+      includeExports: true,
       globals: {
         Buffer: true,
         global: true,
@@ -16,7 +17,12 @@ export default defineConfig({
       },
     }),
   ],
+  resolve: {
+    alias: {
+      webtorrent: 'webtorrent/dist/webtorrent.min.js',
+    },
+  },
   server: {
-    port: 3000
-  }
+    port: 3000,
+  },
 })

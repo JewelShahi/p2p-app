@@ -5,8 +5,11 @@ import { createElement } from 'react';
 
 const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-const CHUNK_SIZE = 64 * 1024;
-const BACKPRESSURE_LIMIT = 2 * 1024 * 1024;
+// FIX (corruption): 16KB is the safe max message size across ALL browsers,
+// including mobile Safari/Chrome. 64KB can be silently dropped/split on some
+// mobile WebRTC stacks — a prime cause of "corrupted" files.
+const CHUNK_SIZE = 16 * 1024;
+const BACKPRESSURE_LIMIT = 1 * 1024 * 1024; // pause sending above 1MB buffered
 
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -24,17 +27,10 @@ const ICE_SERVERS = [
 ];
 
 // ──── Module-level receive listener tracking ────
-// Allows cleanup between successive receiveFiles() calls on the same peer
-// (e.g. 2nd/3rd batch) without listener stacking, which was the root cause
-// of doubled toasts and corrupted downloads.
 let _recvHandler = null;
 let _recvChannel = null;
 let _recvPendingConnect = null;
 
-/**
- * Remove the active receive channel listener (if any). Called at the start
- * of each receiveFiles() and from JoinRoom's peer 'close' handler.
- */
 export function cleanupReceiveListener() {
   if (_recvHandler && _recvChannel) {
     try { _recvChannel.removeEventListener('message', _recvHandler); } catch {}
@@ -49,34 +45,33 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
     trickle: true,
     config: { iceServers: ICE_SERVERS },
   });
+
   peer.on('signal', (signal) => {
     socket.emit('signal', { targetSocketId, signal });
   });
 
   let disconnectTimer = null;
-
   peer._pc?.addEventListener?.('iceconnectionstatechange', () => {
     const state = peer._pc.iceConnectionState;
-
     if (state === 'connected' || state === 'completed') {
       if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
       return;
     }
-
     if (state === 'failed') {
       if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
       onFailed?.(state);
       return;
     }
-
     if (state === 'disconnected') {
+      // FIX (mobile): give a backgrounded phone longer to come back before
+      // we declare the peer dead. 5s was too short for a gallery round-trip.
       if (disconnectTimer) clearTimeout(disconnectTimer);
       disconnectTimer = setTimeout(() => {
         const current = peer._pc?.iceConnectionState;
         if (current === 'disconnected' || current === 'failed') {
           onFailed?.(current);
         }
-      }, 5000);
+      }, 15000);
     }
   });
 
@@ -88,16 +83,16 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
   let sentTotal = 0;
   let cancelled = false;
 
-  console.log('[sendFiles] starting', { fileCount: files.length, totalSize, peerConnected: peer.connected });
-
   const channelMessageHandler = (event) => {
     const data = event.data;
     if (typeof data === 'string') {
-      const msg = JSON.parse(data);
-      if (msg.type === 'cancel') {
-        cancelled = true;
-        onCancel?.();
-      }
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type === 'cancel') {
+          cancelled = true;
+          onCancel?.();
+        }
+      } catch {}
     }
   };
 
@@ -108,17 +103,21 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
       peer.once('connect', attachChannelListener);
     }
   };
-
-  if (peer._channel) {
-    attachChannelListener();
-  } else {
-    peer.once('connect', attachChannelListener);
-  }
+  attachChannelListener();
 
   const waitForConnect = () =>
     new Promise((resolve) => {
       if (peer.connected) return resolve();
       peer.once('connect', () => resolve());
+    });
+
+  const waitForDrain = () =>
+    new Promise((resolve) => {
+      const check = () => {
+        if (!peer._channel || peer._channel.bufferedAmount <= BACKPRESSURE_LIMIT) return resolve();
+        setTimeout(check, 40);
+      };
+      check();
     });
 
   (async () => {
@@ -127,40 +126,37 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 
       for (const f of files) {
         if (cancelled) break;
-        console.log('[sendFiles] starting file', f.name, f.size);
+
+        // Announce file with its exact size so the receiver can verify it.
         peer.send(JSON.stringify({ type: 'file-start', id: f.id, name: f.name, size: f.size }));
 
         const reader = f.file.stream().getReader();
-        let chunkCount = 0;
         while (true) {
           if (cancelled) break;
           const { done, value } = await reader.read();
           if (done) break;
+
           for (let o = 0; o < value.byteLength; o += CHUNK_SIZE) {
             if (cancelled) break;
-
-            while (peer._channel && peer._channel.bufferedAmount > BACKPRESSURE_LIMIT) {
-              await new Promise((r) => setTimeout(r, 50));
-            }
-
+            await waitForDrain();
             const slice = value.slice(o, o + CHUNK_SIZE);
             peer.send(slice);
             sentTotal += slice.byteLength;
-            chunkCount++;
             onProgress?.(Math.min(sentTotal / totalSize, 1));
           }
         }
-        console.log('[sendFiles] finished file', f.name, 'chunks sent:', chunkCount);
-        if (!cancelled) peer.send(JSON.stringify({ type: 'file-end', id: f.id }));
+
+        // file-end carries the byte size so the receiver can do a per-file check.
+        if (!cancelled) peer.send(JSON.stringify({ type: 'file-end', id: f.id, size: f.size }));
       }
+
       if (!cancelled) {
-        peer.send(JSON.stringify({ type: 'transfer-complete' }));
-
+        // transfer-complete carries the grand total for a final integrity check.
+        peer.send(JSON.stringify({ type: 'transfer-complete', totalSize }));
+        // Flush the channel fully before we resolve, so nothing is lost.
         while (peer._channel && peer._channel.bufferedAmount > 0) {
-          await new Promise((r) => setTimeout(r, 50));
+          await new Promise((r) => setTimeout(r, 40));
         }
-
-        console.log('[sendFiles] fully flushed, total bytes:', sentTotal);
         onDone?.();
       }
     } catch (err) {
@@ -175,15 +171,7 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
 }
 
 export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onError }) {
-  // ──── Clean up any previous listener from a prior batch ────
-  // This is THE fix for the 2nd/3rd batch bug. Previously, each call
-  // to receiveFiles added a NEW listener to the same channel without
-  // removing the old one — so every chunk was processed N times (N =
-  // batch number), causing doubled toasts, corrupted files, and
-  // eventually a frozen download.
   cleanupReceiveListener();
-
-  // Also clean up any pending connect handler from a previous call
   if (_recvPendingConnect) {
     try { peer.off('connect', _recvPendingConnect); } catch {}
     _recvPendingConnect = null;
@@ -191,12 +179,11 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
 
   let writer = null;
   let currentMeta = null;
-  let received = 0;
-  let totalExpected = 0;
+  let received = 0;         // total bytes across all files
+  let fileReceived = 0;     // bytes for the current file (integrity)
+  let totalExpected = 0;    // sum of announced file sizes
   let completed = false;
   const zipParts = [];
-
-  console.log('[receiveFiles] listening, peer connected:', peer.connected, 'channel exists:', !!peer._channel);
 
   let writeQueue = Promise.resolve();
   const enqueue = (task) => {
@@ -210,20 +197,17 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
 
   const channelMessageHandler = (event) => {
     const data = event.data;
-    // Guard: if this handler has been superseded by a new receiveFiles
-    // call, ignore the message. (Shouldn't happen since we remove the
-    // listener above, but this is a safety net.)
     if (_recvHandler !== channelMessageHandler) return;
 
     enqueue(async () => {
       if (typeof data === 'string') {
-        const msg = JSON.parse(data);
-        console.log('[receiveFiles] control message', msg.type);
+        let msg;
+        try { msg = JSON.parse(data); } catch { return; }
 
         if (msg.type === 'file-start') {
           currentMeta = msg;
-          totalExpected += msg.size;
-
+          fileReceived = 0;
+          totalExpected += msg.size || 0;
           const handle = fileHandles?.get(msg.id);
           if (mode === 'individual' && handle) {
             writer = await handle.createWritable();
@@ -234,6 +218,17 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
         }
 
         if (msg.type === 'file-end') {
+          // ── PER-FILE INTEGRITY CHECK ──
+          const expected = msg.size ?? currentMeta?.size ?? 0;
+          if (expected && fileReceived !== expected) {
+            console.error('[receiveFiles] size mismatch', currentMeta?.name, fileReceived, 'vs', expected);
+            try { if (writer?.abort) await writer.abort(); } catch {}
+            writer = null;
+            // Refuse to deliver a truncated/corrupt file.
+            onError?.('incomplete-file');
+            return;
+          }
+
           if (mode === 'individual' && writer?.close) {
             await writer.close();
           } else if (mode === 'individual') {
@@ -246,14 +241,25 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
         }
 
         if (msg.type === 'transfer-complete') {
-          console.log('[receiveFiles] transfer-complete received, total bytes:', received);
+          // ── FINAL INTEGRITY CHECK ──
+          if (msg.totalSize != null && received !== msg.totalSize) {
+            console.error('[receiveFiles] total mismatch', received, 'vs', msg.totalSize);
+            onError?.('incomplete-transfer');
+            return;
+          }
+
           completed = true;
           if (mode === 'zip') {
             const JSZip = (await import('jszip')).default;
             const zip = new JSZip();
             zipParts.forEach((p) => zip.file(p.name, p.blob));
-            const blob = await zip.generateAsync({ type: 'blob' });
-            triggerDownload(blob, 'download.zip');
+            // STORE (level 0): files are already compressed formats most of the
+            // time; this is far faster and avoids OOM on mobile for big batches.
+            const blob = await zip.generateAsync({
+              type: 'blob',
+              compression: 'STORE',
+            });
+            triggerDownload(blob, (currentMeta?.batchName || 'files') + '.zip');
           }
           onDone?.();
         }
@@ -261,14 +267,15 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
       }
 
       // Binary chunk
-      received += data.byteLength;
+      const len = data.byteLength ?? data.size ?? 0;
+      received += len;
+      fileReceived += len;
       onProgress?.(totalExpected ? Math.min(received / totalExpected, 1) : 0);
       if (writer?.write) await writer.write(data);
       else if (writer?.chunks) writer.chunks.push(data);
     });
   };
 
-  // Store at module level so cleanupReceiveListener() can remove it
   _recvHandler = channelMessageHandler;
 
   const attachChannelListener = () => {
@@ -276,7 +283,6 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
       _recvChannel = peer._channel;
       peer._channel.addEventListener('message', channelMessageHandler);
     } else {
-      console.warn('[receiveFiles] peer._channel not available yet, will attach on connect');
       _recvPendingConnect = () => {
         _recvPendingConnect = null;
         _recvChannel = peer._channel;
@@ -285,19 +291,15 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
       peer.once('connect', _recvPendingConnect);
     }
   };
-
   attachChannelListener();
 
-  // ──── NO peer.on('close') or peer.on('error') here ────
-  // The caller (JoinRoom) handles those events and calls
-  // cleanupReceiveListener() when appropriate. Having them here caused
-  // stacking when receiveFiles was called multiple times on the same
-  // peer — each call added ANOTHER close/error handler.
+  // Expose whether the transfer truly completed, so callers don't mark a
+  // truncated download as "done" on an unexpected channel close.
+  return { isComplete: () => completed };
 }
 
 function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob);
-
   const doDownload = () => {
     const a = document.createElement('a');
     a.href = url;
@@ -309,16 +311,11 @@ function triggerDownload(blob, name) {
 
   if (!isMobile) {
     doDownload();
-    // FIX: Don't revoke immediately — the browser needs the URL to be
-    // valid when it actually reads the blob data for the download.
-    // Revoking too fast could truncate the file on slower systems.
     setTimeout(() => URL.revokeObjectURL(url), 10000);
     return;
   }
 
-  // Mobile: show toast with tappable Save button (trusted user gesture)
   const revokeTimer = setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
-
   toast(
     (t) =>
       createElement(

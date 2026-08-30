@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import { Upload, Power, Users, Send, FolderOpen, Link, Clock, HardDrive } from 'lucide-react';
-import socket from '../api/socket';
+import socket, { wireVisibilityReconnect } from '../api/socket';
 import ShareLink from '../components/ShareLink';
 import CountdownTimer from '../components/CountdownTimer';
 import TransferProgress from '../components/TransferProgress';
@@ -38,6 +38,12 @@ export default function HostRoom() {
   const peersRef = useRef([]);
   useEffect(() => { peersRef.current = peers; }, [peers]);
   const hasJoinedOnce = useRef(false);
+
+  // FIX (ghost users): dedupe the peer list by userId, keeping the newest socket.
+  const upsertPeer = (list, { socketId, userId }) => {
+    const withoutDupes = list.filter((p) => p.userId !== userId && p.socketId !== socketId);
+    return [...withoutDupes, { socketId, userId }];
+  };
 
   useEffect(() => {
     const isPeerReady = (peer) => {
@@ -79,18 +85,14 @@ export default function HostRoom() {
         toast.success('Direct connection established', { id: 'peer-connected' });
         peerRetryCount.current[peerSocketId] = 0;
       });
-
       peer.on('error', (err) => {
         console.error('[peer error]', peerSocketId, err);
         toast.error('Connection to a device failed', { id: 'peer-error' });
       });
-
       peer.on('iceStateChange', (iceState) => {
         console.log('[ICE state]', peerSocketId, iceState);
       });
-
       peer.on('close', () => {
-        console.log('[peer close]', peerSocketId);
         delete peerConnections.current[peerSocketId];
       });
 
@@ -106,8 +108,6 @@ export default function HostRoom() {
         onDone: () => {
           toast.success('Transfer complete', { id: 'transfer-done' });
           setTransfers((t) => ({ ...t, [socketId]: 1 }));
-          // Do NOT destroy the peer — keep it alive for the next batch.
-          // sendFiles' finally block already removes its cancel listener.
         },
         onCancel: () => {
           toast('Peer cancelled the download', { icon: '🛑', id: 'transfer-cancelled' });
@@ -121,10 +121,9 @@ export default function HostRoom() {
       });
     };
 
-    // ──── REJOIN ────
+    // ──── REJOIN (host reuses its identity — no ghosts) ────
     const tryRejoin = () => {
       if (!hostUserId.current) return;
-
       const isFirstJoin = !hasJoinedOnce.current;
       if (!isFirstJoin) setIsReconnecting(true);
 
@@ -137,12 +136,15 @@ export default function HostRoom() {
           navigate('/');
           return;
         }
-
         if (!isFirstJoin) toast.success('Back online', { id: 'rejoin-success' });
 
         if (Array.isArray(res.members)) {
-          const newSocketIds = new Set(res.members.map((m) => m.socketId));
+          // Dedupe the authoritative list by userId (server already does, but be safe).
+          const byUser = new Map();
+          for (const m of res.members) byUser.set(m.userId, m);
+          const members = Array.from(byUser.values());
 
+          const newSocketIds = new Set(members.map((m) => m.socketId));
           for (const oldSid of Object.keys(peerConnections.current)) {
             if (!newSocketIds.has(oldSid)) {
               peerConnections.current[oldSid]?.destroy();
@@ -151,9 +153,9 @@ export default function HostRoom() {
             }
           }
 
-          setPeers(res.members);
+          setPeers(members);
 
-          res.members.forEach((m) => {
+          members.forEach((m) => {
             if (!isPeerReady(peerConnections.current[m.socketId])) {
               if (peerConnections.current[m.socketId]) {
                 peerConnections.current[m.socketId].destroy();
@@ -168,12 +170,11 @@ export default function HostRoom() {
     };
 
     socket.on('connect', tryRejoin);
+    if (socket.connected) tryRejoin();
+    else socket.connect();
 
-    if (socket.connected) {
-      tryRejoin();
-    } else {
-      socket.connect();
-    }
+    // ──── MOBILE: reconnect instantly when the host tab returns (gallery) ────
+    const unwireVisibility = wireVisibilityReconnect();
 
     socket.on('peer-reconnected', ({ userId, socketId }) => {
       const stalePeer = peersRef.current.find((p) => p.userId === userId);
@@ -184,10 +185,7 @@ export default function HostRoom() {
       }
 
       toast.success('A device reconnected', { id: 'peer-reconnected' });
-      setPeers((prev) => {
-        const filtered = prev.filter((p) => p.userId !== userId);
-        return [...filtered, { socketId, userId }];
-      });
+      setPeers((prev) => upsertPeer(prev, { socketId, userId }));
 
       if (!isPeerReady(peerConnections.current[socketId])) {
         if (peerConnections.current[socketId]) {
@@ -200,9 +198,12 @@ export default function HostRoom() {
     });
 
     socket.on('peer-joined', ({ peerSocketId, peerUserId }) => {
-      toast.success('A new device connected', { id: 'peer-joined' });
-      setPeers((p) => [...p, { socketId: peerSocketId, userId: peerUserId }]);
-      connectToPeer(peerSocketId);
+      // FIX (ghost users): dedupe by userId so repeated joins can't stack rows.
+      setPeers((p) => upsertPeer(p, { socketId: peerSocketId, userId: peerUserId }));
+      if (!isPeerReady(peerConnections.current[peerSocketId])) {
+        toast.success('A new device connected', { id: 'peer-joined' });
+        connectToPeer(peerSocketId);
+      }
     });
 
     socket.on('signal', ({ fromSocketId, signal }) => {
@@ -223,27 +224,19 @@ export default function HostRoom() {
         toast('A peer declined the transfer', { icon: 'ℹ️', id: 'transfer-declined' });
         return;
       }
-
       const peer = peerConnections.current[fromSocketId];
-
-      // SIMPLIFIED: since we keep the peer alive between batches, it
-      // should almost always be ready here. Only recreate if it actually
-      // died (e.g. network drop that ICE couldn't recover from).
       if (!isPeerReady(peer)) {
-        console.log('[file-response] peer not ready, recreating', fromSocketId);
         if (peer) {
           peer.destroy();
           delete peerConnections.current[fromSocketId];
           delete peerRetryCount.current[fromSocketId];
         }
         const newPeer = connectToPeer(fromSocketId);
-        // Wait for the new peer to connect before sending
         newPeer.once('connect', () => {
           doSendFiles(newPeer, fromSocketId, filesRef.current);
         });
         return;
       }
-
       doSendFiles(peer, fromSocketId, filesRef.current);
     });
 
@@ -257,7 +250,7 @@ export default function HostRoom() {
     });
 
     socket.on('disconnect', () => {
-      console.log('[socket disconnect] connection dropped, will auto-recover…');
+      console.log('[socket disconnect] will auto-recover…');
     });
 
     return () => {
@@ -270,8 +263,10 @@ export default function HostRoom() {
       socket.off('room-closed');
       socket.off('connect_error');
       socket.off('disconnect');
+      unwireVisibility();
       Object.values(peerConnections.current).forEach((p) => p.destroy());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const onSelectFiles = (e) => {
@@ -283,6 +278,9 @@ export default function HostRoom() {
     }));
     setFiles(list);
     setTransfers({});
+    // FIX (mobile): reset so the host can re-pick the SAME file after the
+    // gallery round-trip (browsers block re-selecting an identical file).
+    e.target.value = '';
   };
 
   const totalSize = files.reduce((s, f) => s + f.size, 0);
@@ -301,7 +299,8 @@ export default function HostRoom() {
       files: files.map((f) => ({ id: f.id, name: f.name, size: f.size })),
       totalSize,
     });
-    toast.success('Offer sent to connected peers', { id: 'offer-sent' });
+    const hint = files.length > 1 ? ' (will arrive as a single .zip)' : '';
+    toast.success('Offer sent to connected peers' + hint, { id: 'offer-sent' });
   };
 
   const terminateRoom = () => {
@@ -309,15 +308,12 @@ export default function HostRoom() {
       toast.error(!socket.connected ? 'No connection — please wait' : 'Still reconnecting — please wait', { id: 'terminate-blocked' });
       return;
     }
-    socket.emit('terminate-room', {
-      roomId,
-      userId: hostUserId.current,
-    }, (res) => {
+    socket.emit('terminate-room', { roomId, userId: hostUserId.current }, (res) => {
       if (!res?.ok) {
         toast.error("Couldn't end the session — please try again", { id: 'terminate-fail' });
-        console.error('[terminateRoom] failed', res);
         return;
       }
+      sessionStorage.removeItem(`hostUserId:${roomId}`);
       Object.values(peerConnections.current).forEach((p) => cancelTransfer(p));
       navigate('/');
     });
@@ -456,7 +452,7 @@ export default function HostRoom() {
                   <Upload size={22} className="text-base-content/25 group-hover:text-primary transition-colors" />
                 </div>
                 <span className="text-sm font-medium text-base-content/50 group-hover:text-primary transition-colors">Click to browse</span>
-                <span className="text-[11px] text-base-content/25 mt-1">Supports multiple files up to 10GB</span>
+                <span className="text-[11px] text-base-content/25 mt-1">Multiple files arrive as one .zip · up to 10GB</span>
               </label>
               {files.length > 0 && (
                 <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
