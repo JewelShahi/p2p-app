@@ -2,12 +2,77 @@
 import { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { Users, LogOut, Wifi, Clock, ArrowDownToLine, CheckCircle2 } from 'lucide-react';
+import {
+  Users, LogOut, Wifi, ArrowDownToLine, CheckCircle2, Radio, ShieldCheck, Copy,
+} from 'lucide-react';
 import socket, { wireVisibilityReconnect } from '../api/socket';
 import CountdownTimer from '../components/CountdownTimer';
 import FileOfferModal from '../components/FileOfferModal';
 import TransferProgress from '../components/TransferProgress';
 import { createPeerConnection, receiveFiles, cleanupReceiveListener } from '../utils/peerTransfer';
+
+/* ── Motion & effects — same design system as Home/HostRoom, reduced-motion safe ── */
+const CSS = `
+  @keyframes pd-rise {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .pd-rise { animation: pd-rise .7s cubic-bezier(.22,1,.36,1) both; }
+
+  @keyframes pd-float {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-18px); }
+  }
+  .pd-float { animation: pd-float 9s ease-in-out infinite; }
+
+  @keyframes pd-scan {
+    0%        { transform: translateX(-110%); }
+    55%, 100% { transform: translateX(430%); }
+  }
+  .pd-scan { animation: pd-scan 4.5s cubic-bezier(.4,0,.2,1) infinite; }
+
+  .peerdrop-dotgrid {
+    background-image: radial-gradient(currentColor 1px, transparent 1px);
+    background-size: 18px 18px;
+    -webkit-mask-image: radial-gradient(ellipse 60% 55% at 50% 20%, #000 0%, transparent 75%);
+    mask-image: radial-gradient(ellipse 60% 55% at 50% 20%, #000 0%, transparent 75%);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pd-rise, .pd-float, .pd-scan { animation: none !important; }
+    .animate-ping, .animate-pulse { animation: none !important; }
+    .peerdrop-dotgrid { display: none; }
+  }
+`;
+
+const CARD = 'card h-full overflow-hidden border border-base-300/60 bg-base-100/95 shadow-sm backdrop-blur-sm';
+
+/* Radar rings while the receiver waits for the host — mirrors HostRoom's "waiting for devices". */
+function WaitingRadar({ icon: Icon = Radio }) {
+  return (
+    <span className="relative flex h-16 w-16 items-center justify-center" aria-hidden="true">
+      <span className="absolute inset-0 animate-ping rounded-full bg-primary/10" style={{ animationDuration: '2.2s' }} />
+      <span className="absolute inset-0 animate-ping rounded-full bg-primary/10" style={{ animationDuration: '2.2s', animationDelay: '0.7s' }} />
+      <span className="relative flex h-11 w-11 items-center justify-center rounded-full bg-primary/10 text-primary">
+        <Icon size={18} />
+      </span>
+    </span>
+  );
+}
+
+/* Shared card header: icon tile + title + divider + optional right slot. */
+function CardHeader({ icon: Icon, tint, title, right }) {
+  return (
+    <div className="flex items-center gap-3">
+      <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${tint}`}>
+        <Icon size={16} />
+      </div>
+      <h2 className="text-sm font-semibold whitespace-nowrap">{title}</h2>
+      <span className="h-px flex-1 bg-base-300/60" />
+      {right}
+    </div>
+  );
+}
 
 export default function JoinRoom() {
   const { roomId } = useParams();
@@ -362,170 +427,250 @@ export default function JoinRoom() {
     navigate('/');
   };
 
-  return (
-    <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
+  // Additive, logic-free convenience.
+  const copyRoomId = async () => {
+    try {
+      await navigator.clipboard.writeText(roomId);
+      toast.success('Room ID copied', { id: 'copy-room' });
+    } catch {
+      toast.error('Could not copy the room ID', { id: 'copy-fail' });
+    }
+  };
 
-      {/* Top Bar */}
-      <div className="navbar bg-base-100 rounded-2xl shadow-sm border border-base-300/50 px-4 sm:px-6 mb-6">
-        <div className="flex-1 gap-3">
-          <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
-            <Users size={18} className="text-primary" />
+  const statusBadge = !socket.connected
+    ? { cls: 'bg-error/10 text-error', dot: 'bg-error', label: 'Disconnected' }
+    : isReconnecting
+      ? { cls: 'bg-warning/10 text-warning', dot: 'bg-warning', label: 'Reconnecting' }
+      : downloadState === 'downloading'
+        ? { cls: 'bg-primary/10 text-primary', dot: 'bg-primary', label: 'Transferring' }
+        : { cls: 'bg-success/10 text-success', dot: 'bg-success', label: 'Connected' };
+
+  return (
+    <div className="relative min-h-[calc(100vh-4rem)] max-w-7xl mx-auto p-4 sm:p-6 lg:p-8 overflow-hidden">
+      <style>{CSS}</style>
+
+      {/* backdrop */}
+      <div className="peerdrop-dotgrid pointer-events-none absolute inset-0 text-base-content/[0.06]" aria-hidden="true" />
+      <div className="pd-float pointer-events-none absolute -top-20 left-[4%] h-72 w-72 rounded-full bg-primary/[0.07] blur-3xl" aria-hidden="true" />
+      <div className="pd-float pointer-events-none absolute bottom-10 right-[2%] h-72 w-72 rounded-full bg-secondary/[0.06] blur-3xl" style={{ animationDelay: '-4.5s' }} aria-hidden="true" />
+
+      <div className="relative">
+
+        {/* ── Top Bar ── */}
+        <div className="pd-rise relative mb-6 overflow-hidden rounded-2xl border border-base-300/60 bg-base-100/95 shadow-sm backdrop-blur-xl">
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[2px] overflow-hidden">
+            <div className="pd-scan absolute inset-y-0 w-1/4 bg-gradient-to-r from-transparent via-primary/70 to-transparent" />
           </div>
-          <div>
-            <p className="text-sm font-semibold leading-tight">Joined Session</p>
-            <p className="text-xs text-base-content/40 font-mono">{roomId}</p>
+
+          <div className="flex items-center gap-3 px-4 py-3.5 sm:px-6">
+            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/10">
+              <Users size={18} className="text-primary" />
+              <span className="absolute -right-0.5 -top-0.5 flex h-3 w-3">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+                <span className="relative inline-flex h-3 w-3 rounded-full border-2 border-base-100 bg-success" />
+              </span>
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-sm font-semibold leading-tight">Joined Session</p>
+                {isReconnecting ? (
+                  <span className="badge badge-warning badge-sm gap-1 border-transparent bg-warning/10 text-warning">
+                    <span className="loading loading-spinner loading-xs" /> Reconnecting…
+                  </span>
+                ) : (
+                  <span className="badge badge-sm gap-1.5 border-transparent bg-success/10 text-success">
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" /> Live
+                  </span>
+                )}
+              </div>
+              <p className="truncate font-mono text-xs text-base-content/40">{roomId}</p>
+            </div>
+
+            <div className="hidden shrink-0 sm:block">
+              {expiresAt && <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />}
+            </div>
+
+            <button
+              className="btn btn-ghost btn-sm gap-2 border border-base-300/60 text-error hover:bg-error/10 hover:text-error disabled:opacity-40"
+              onClick={leaveSession}
+              disabled={isReconnecting || !socket.connected}
+              title="Disconnect and return home"
+            >
+              <LogOut size={15} />
+              <span className="hidden sm:inline">Leave</span>
+            </button>
           </div>
-          {isReconnecting && (
-            <span className="badge badge-warning badge-sm gap-1">
-              <span className="loading loading-spinner loading-xs" /> Reconnecting…
-            </span>
-          )}
         </div>
 
-        <div className="flex-none hidden sm:flex">
+        {/* Mobile Timer */}
+        <div className="pd-rise mb-6 sm:hidden" style={{ animationDelay: '80ms' }}>
           {expiresAt && <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />}
         </div>
 
-        <div className="flex-none ml-4">
-          <button
-            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error disabled:opacity-40"
-            onClick={leaveSession}
-            disabled={isReconnecting || !socket.connected}
-          >
-            <LogOut size={15} />
-            <span className="hidden sm:inline">Leave</span>
-          </button>
-        </div>
-      </div>
+        {/* ── Bento Grid ── */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
 
-      {/* Mobile Timer */}
-      <div className="sm:hidden mb-6">
-        {expiresAt && <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />}
-      </div>
-
-      {/* Bento Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
-
-        {/* Main Status */}
-        <div className="md:col-span-8">
-          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
-            <div className="card-body p-5 gap-4">
-              <div className="flex items-center gap-3">
-                <div className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors duration-300 ${
-                  downloadState === 'complete' ? 'bg-success/10'
-                    : downloadState === 'downloading' ? 'bg-primary/10'
-                    : 'bg-base-200/70'
-                }`}>
-                  {downloadState === 'complete' ? <CheckCircle2 size={16} className="text-success" />
-                    : downloadState === 'downloading' ? <ArrowDownToLine size={16} className="text-primary" />
-                    : <Wifi size={16} className="text-base-content/30" />}
-                </div>
-                <h2 className="card-title text-sm font-semibold">
-                  {downloadState === 'complete' ? 'Downloaded'
-                    : downloadState === 'downloading' ? 'Receiving Files'
-                    : 'Waiting for Host'}
-                </h2>
-                {downloadState === 'downloading' && (
-                  <span className="badge badge-primary badge-sm font-mono ml-auto">
-                    {Math.round((progress ?? 0) * 100)}%
-                  </span>
-                )}
-                {downloadState === 'complete' && (
-                  <span className="badge badge-success badge-sm gap-1 ml-auto">
-                    <CheckCircle2 size={10} /> Saved
-                  </span>
-                )}
-              </div>
-
+          {/* Main Status */}
+          <div className="pd-rise md:col-span-8" style={{ animationDelay: '160ms' }}>
+            <div
+              className={`card relative h-full overflow-hidden border bg-base-100/95 shadow-sm backdrop-blur-sm transition-all duration-500 ${
+                downloadState === 'downloading'
+                  ? 'border-primary/40 shadow-lg shadow-primary/15'
+                  : downloadState === 'complete'
+                    ? 'border-success/40 shadow-lg shadow-success/10'
+                    : 'border-base-300/60'
+              }`}
+            >
+              {/* scanning light while a transfer is in flight */}
               {downloadState === 'downloading' && (
-                <div className="py-2">
-                  <TransferProgress label="Downloading" progress={progress ?? 0} />
+                <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[2px] overflow-hidden">
+                  <div className="pd-scan absolute inset-y-0 w-1/4 bg-gradient-to-r from-transparent via-primary/80 to-transparent" />
                 </div>
               )}
 
-              {downloadState === 'complete' && (
-                <div className="flex flex-col items-center justify-center py-10 text-center">
-                  <div className="relative mb-5">
-                    <div className="w-20 h-20 rounded-full bg-success/10 flex items-center justify-center">
-                      <CheckCircle2 size={36} className="text-success" />
+              <div className="card-body relative h-full gap-4 p-5">
+                <CardHeader
+                  icon={
+                    downloadState === 'complete' ? CheckCircle2
+                      : downloadState === 'downloading' ? ArrowDownToLine
+                      : Wifi
+                  }
+                  tint={
+                    downloadState === 'complete' ? 'bg-success/10 text-success'
+                      : downloadState === 'downloading' ? 'bg-primary/10 text-primary'
+                      : 'bg-base-200/70 text-base-content/30'
+                  }
+                  title={
+                    downloadState === 'complete' ? 'Downloaded'
+                      : downloadState === 'downloading' ? 'Receiving Files'
+                      : 'Waiting for Host'
+                  }
+                  right={
+                    downloadState === 'downloading' ? (
+                      <span className="badge badge-sm border-transparent bg-primary/10 font-mono text-primary">
+                        {Math.round((progress ?? 0) * 100)}%
+                      </span>
+                    ) : downloadState === 'complete' ? (
+                      <span className="badge badge-sm gap-1 border-transparent bg-success/10 text-success">
+                        <CheckCircle2 size={10} /> Saved
+                      </span>
+                    ) : undefined
+                  }
+                />
+
+                {downloadState === 'downloading' && (
+                  <>
+                    <div className="py-2">
+                      <TransferProgress label="Downloading" progress={progress ?? 0} />
+                    </div>
+                    <div className="mt-auto flex items-center justify-center gap-1.5 text-[11px] text-base-content/35">
+                      <ShieldCheck size={12} className="text-success/70" />
+                      Transferring directly from the host — keep this tab open
+                    </div>
+                  </>
+                )}
+
+                {downloadState === 'complete' && (
+                  <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
+                    <span className="relative flex h-20 w-20 items-center justify-center" aria-hidden="true">
+                      <span className="absolute inset-0 animate-ping rounded-full bg-success/15" style={{ animationDuration: '2.4s' }} />
+                      <span className="relative flex h-16 w-16 items-center justify-center rounded-full bg-success/10">
+                        <CheckCircle2 size={32} className="text-success" />
+                      </span>
+                    </span>
+                    <p className="mt-5 text-lg font-semibold text-base-content/80">Files Downloaded</p>
+                    <p className="mt-1.5 max-w-xs text-xs text-base-content/30">
+                      The host can send more files — a new offer will appear automatically.
+                    </p>
+                  </div>
+                )}
+
+                {downloadState === 'idle' && (
+                  <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
+                    <WaitingRadar icon={Wifi} />
+                    <p className="mt-4 text-sm font-medium text-base-content/50">Standing by</p>
+                    <p className="mt-1 max-w-xs text-xs text-base-content/25">
+                      The host will send a file offer once they are ready to share.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Side Panel */}
+          <div className="md:col-span-4 flex flex-col gap-4 lg:gap-5">
+
+            {/* Session info */}
+            <div className="pd-rise" style={{ animationDelay: '240ms' }}>
+              <div className={`${CARD} relative`}>
+                <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-secondary/[0.07] via-transparent to-transparent" />
+                <div className="card-body relative gap-4 p-5">
+                  <CardHeader icon={Radio} tint="bg-secondary/10 text-secondary" title="Session" />
+
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-base-content/40">Status</span>
+                      <span className={`badge badge-sm gap-1.5 border-transparent font-medium ${statusBadge.cls}`}>
+                        <span className={`h-1.5 w-1.5 rounded-full ${statusBadge.dot} ${socket.connected ? 'animate-pulse' : ''}`} />
+                        {statusBadge.label}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-base-content/40">Role</span>
+                      <span className="font-medium text-base-content/70">Receiver</span>
+                    </div>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-base-content/40">Encryption</span>
+                      <span className="flex items-center gap-1.5 font-medium text-base-content/70">
+                        <ShieldCheck size={13} className="text-success/70" /> End-to-end
+                      </span>
+                    </div>
+                    <div className="mt-1 border-t border-base-300/50 pt-3">
+                      <p className="mb-1.5 text-[11px] font-medium uppercase tracking-widest text-base-content/30">Room ID</p>
+                      <div className="flex items-center gap-2">
+                        <p className="min-w-0 flex-1 break-all font-mono text-sm font-semibold text-base-content/70">{roomId}</p>
+                        <button
+                          className="btn btn-ghost btn-xs shrink-0 text-base-content/40 hover:bg-base-200 hover:text-base-content/70"
+                          onClick={copyRoomId}
+                          aria-label="Copy room ID"
+                        >
+                          <Copy size={13} />
+                        </button>
+                      </div>
                     </div>
                   </div>
-                  <p className="text-lg font-semibold text-base-content/80">Files Downloaded</p>
-                  <p className="text-xs text-base-content/30 mt-1.5 max-w-xs">
-                    The host can send more files — a new offer will appear automatically.
-                  </p>
                 </div>
-              )}
+              </div>
+            </div>
 
-              {downloadState === 'idle' && (
-                <div className="flex flex-col items-center justify-center py-12 text-center">
-                  <div className="w-16 h-16 rounded-2xl bg-base-200/70 flex items-center justify-center mb-4">
-                    <Clock size={28} className="text-base-content/20" />
+            {/* Leave */}
+            <div className="pd-rise flex-1" style={{ animationDelay: '320ms' }}>
+              <div className={`${CARD} relative`}>
+                <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-error/[0.04] to-transparent" />
+                <div className="card-body relative h-full justify-center gap-4 p-5">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-error/10 text-error">
+                      <LogOut size={16} />
+                    </div>
+                    <h2 className="text-sm font-semibold">Done here?</h2>
                   </div>
-                  <p className="text-sm font-medium text-base-content/50">Stand by</p>
-                  <p className="text-xs text-base-content/25 mt-1 max-w-xs">
-                    The host will send a file offer once they are ready to share.
+                  <p className="text-xs leading-relaxed text-base-content/40">
+                    Safely disconnect from the host and return to the home screen.
                   </p>
+                  <button
+                    className="btn btn-error btn-outline w-full gap-2 transition-all duration-200 enabled:hover:-translate-y-0.5 disabled:opacity-40"
+                    onClick={leaveSession}
+                    disabled={isReconnecting || !socket.connected}
+                  >
+                    <LogOut size={16} />
+                    Leave Session
+                  </button>
                 </div>
-              )}
+              </div>
             </div>
-          </div>
-        </div>
 
-        {/* Side Panel */}
-        <div className="md:col-span-4 flex flex-col gap-4 lg:gap-5">
-          <div className="card bg-base-100 shadow-sm border border-base-300/50">
-            <div className="card-body p-5 gap-4">
-              <div className="flex items-center gap-3">
-                <div className="w-9 h-9 rounded-lg bg-secondary/10 flex items-center justify-center">
-                  <Wifi size={16} className="text-secondary" />
-                </div>
-                <h2 className="card-title text-sm font-semibold">Session</h2>
-              </div>
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-base-content/40">Status</span>
-                  <span className={`badge badge-sm gap-1 ${
-                    !socket.connected ? 'badge-error'
-                      : isReconnecting ? 'badge-warning'
-                      : downloadState === 'downloading' ? 'badge-primary'
-                      : 'badge-success'
-                  }`}>
-                    {!socket.connected ? 'Disconnected'
-                      : isReconnecting ? 'Reconnecting'
-                      : downloadState === 'downloading' ? 'Transferring'
-                      : 'Connected'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-base-content/40">Role</span>
-                  <span className="text-base-content/70 font-medium">Receiver</span>
-                </div>
-                <div className="pt-2 mt-2 border-t border-base-300/50">
-                  <p className="text-[11px] text-base-content/30 uppercase tracking-widest font-medium mb-1">Room ID</p>
-                  <p className="text-sm font-mono font-semibold text-base-content/70 break-all">{roomId}</p>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="card bg-base-100 shadow-sm border border-base-300/50 flex-1">
-            <div className="card-body p-5 justify-center gap-4">
-              <div>
-                <h2 className="text-sm font-semibold mb-1">Done here?</h2>
-                <p className="text-xs text-base-content/40 leading-relaxed">
-                  Safely disconnect from the host and return to the home screen.
-                </p>
-              </div>
-              <button
-                className="btn btn-error btn-outline w-full gap-2 disabled:opacity-40"
-                onClick={leaveSession}
-                disabled={isReconnecting || !socket.connected}
-              >
-                <LogOut size={16} />
-                Leave Session
-              </button>
-            </div>
           </div>
         </div>
       </div>

@@ -2,7 +2,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { Upload, Power, Users, Send, FolderOpen, Link, Clock, HardDrive } from 'lucide-react';
+import {
+  Upload, Power, Users, Send, FolderOpen, Link, HardDrive,
+  Radio, X, ShieldCheck, Check, Zap,
+} from 'lucide-react';
 import socket, { wireVisibilityReconnect } from '../api/socket';
 import ShareLink from '../components/ShareLink';
 import CountdownTimer from '../components/CountdownTimer';
@@ -10,16 +13,120 @@ import TransferProgress from '../components/TransferProgress';
 import { createPeerConnection, sendFiles, cancelTransfer } from '../utils/peerTransfer';
 import { formatBytes } from '../utils/formatBytes';
 
+const SIZE_LIMIT = 10 * 1024 * 1024 * 1024; // display only — the real check lives in submitOffer
+
+/* ── Motion & effects — self-contained, reduced-motion safe ── */
+const CSS = `
+  @keyframes pd-rise {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .pd-rise { animation: pd-rise .7s cubic-bezier(.22,1,.36,1) both; }
+
+  @keyframes pd-float {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-18px); }
+  }
+  .pd-float { animation: pd-float 9s ease-in-out infinite; }
+
+  @keyframes pd-bar {
+    0%, 100% { transform: scaleY(.4); opacity: .55; }
+    50%      { transform: scaleY(1);  opacity: 1; }
+  }
+  .pd-bar { transform-origin: bottom; animation: pd-bar 1.3s ease-in-out infinite; }
+
+  @keyframes pd-scan {
+    0%        { transform: translateX(-110%); }
+    55%, 100% { transform: translateX(430%); }
+  }
+  .pd-scan { animation: pd-scan 4.5s cubic-bezier(.4,0,.2,1) infinite; }
+
+  .pd-shine { position: relative; overflow: hidden; }
+  .pd-shine::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(105deg, transparent 40%, rgb(255 255 255 / .28) 50%, transparent 60%);
+    transform: translateX(-130%);
+    transition: transform .7s ease;
+    pointer-events: none;
+  }
+  .pd-shine:hover::after { transform: translateX(130%); }
+
+  .peerdrop-dotgrid {
+    background-image: radial-gradient(currentColor 1px, transparent 1px);
+    background-size: 18px 18px;
+    -webkit-mask-image: radial-gradient(ellipse 60% 55% at 50% 20%, #000 0%, transparent 75%);
+    mask-image: radial-gradient(ellipse 60% 55% at 50% 20%, #000 0%, transparent 75%);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pd-rise, .pd-float, .pd-bar, .pd-scan { animation: none !important; }
+    .pd-shine::after { display: none; }
+    .peerdrop-dotgrid { display: none; }
+  }
+`;
+
+const CARD = 'card h-full overflow-hidden border border-base-300/60 bg-base-100/95 shadow-sm backdrop-blur-sm';
+
+/* Four pulsing bars — matches the "live signal" language of the landing page. */
+function SignalBars() {
+  return (
+    <span className="inline-flex items-end gap-[3px] h-4 shrink-0" aria-hidden="true">
+      {[5, 8, 11, 14].map((h, i) => (
+        <span
+          key={h}
+          className="w-[3px] rounded-full bg-gradient-to-t from-primary/60 to-success pd-bar"
+          style={{ height: h, animationDelay: `${i * 160}ms` }}
+        />
+      ))}
+    </span>
+  );
+}
+
+/* Expanding radar rings while we wait for a device to join. */
+function WaitingRadar() {
+  return (
+    <span className="relative flex h-14 w-14 items-center justify-center" aria-hidden="true">
+      <span className="absolute inset-0 animate-ping rounded-full bg-primary/10" style={{ animationDuration: '2.2s' }} />
+      <span className="absolute inset-0 animate-ping rounded-full bg-primary/10" style={{ animationDuration: '2.2s', animationDelay: '0.7s' }} />
+      <span className="relative flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-primary">
+        <Radio size={15} />
+      </span>
+    </span>
+  );
+}
+
+/* Shared card header: icon tile + title + divider + optional right slot. */
+function CardHeader({ icon: Icon, tint, title, right }) {
+  return (
+    <div className="flex items-center gap-3">
+      <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${tint}`}>
+        <Icon size={16} />
+      </div>
+      <h2 className="text-sm font-semibold whitespace-nowrap">{title}</h2>
+      <span className="h-px flex-1 bg-base-300/60" />
+      {right}
+    </div>
+  );
+}
+
 export default function HostRoom() {
   const { roomId } = useParams();
   const { state } = useLocation();
   const navigate = useNavigate();
 
-  const [expiresAt] = useState(state?.expiresAt || Date.now() + 20 * 60 * 1000);
+  // FIX (timer drift): this must be stateful. It used to be `useState` with no
+  // setter, so it only ever reflected `location.state` from the very first
+  // mount. Leaving and coming back (refresh, closed tab, remount) wiped
+  // `location.state`, so it fell back to a brand new made-up 20-minute window
+  // that had nothing to do with the room's real expiry — hence the drift
+  // against the receiver, who always gets the real value from the server.
+  const [expiresAt, setExpiresAt] = useState(state?.expiresAt || Date.now() + 20 * 60 * 1000);
   const [peers, setPeers] = useState([]);
   const [files, setFiles] = useState([]);
   const [transfers, setTransfers] = useState({});
   const [isReconnecting, setIsReconnecting] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
 
   const peerConnections = useRef({});
   const peerRetryCount = useRef({});
@@ -137,6 +244,10 @@ export default function HostRoom() {
           return;
         }
         if (!isFirstJoin) toast.success('Back online', { id: 'rejoin-success' });
+
+        // FIX (timer drift): always resync to the server's authoritative
+        // expiry on every (re)join, exactly like JoinRoom already does.
+        if (res.expiresAt) setExpiresAt(res.expiresAt);
 
         if (Array.isArray(res.members)) {
           // Dedupe the authoritative list by userId (server already does, but be safe).
@@ -269,21 +380,53 @@ export default function HostRoom() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const onSelectFiles = (e) => {
-    const list = Array.from(e.target.files).map((file) => ({
+  // Shared by the file input AND drag & drop — same mapping/reset logic as before.
+  const addFiles = (fileList) => {
+    const list = Array.from(fileList).map((file) => ({
       id: crypto.randomUUID(),
       file,
       name: file.name,
       size: file.size,
     }));
+    if (!list.length) return;
     setFiles(list);
     setTransfers({});
+    toast.success(
+      `${list.length} file${list.length > 1 ? 's' : ''} · ${formatBytes(list.reduce((s, f) => s + f.size, 0))} selected`,
+      { id: 'files-selected' }
+    );
+  };
+
+  const onSelectFiles = (e) => {
+    addFiles(e.target.files);
     // FIX (mobile): reset so the host can re-pick the SAME file after the
     // gallery round-trip (browsers block re-selecting an identical file).
     e.target.value = '';
   };
 
+  const onDropFiles = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
+  };
+
+  const removeFile = (id) => {
+    setFiles((prev) => prev.filter((f) => f.id !== id));
+  };
+
+  const clearFiles = () => setFiles([]);
+
   const totalSize = files.reduce((s, f) => s + f.size, 0);
+  const usagePct = (totalSize / SIZE_LIMIT) * 100;
+  const overLimit = totalSize > SIZE_LIMIT;
+  const activeTransfers = Object.keys(transfers).length;
+  const allReady = files.length > 0 && peers.length > 0 && socket.connected && !isReconnecting;
+
+  const readySteps = [
+    { label: 'Files selected', done: files.length > 0 },
+    { label: 'Device connected', done: peers.length > 0 },
+    { label: 'Server link stable', done: socket.connected && !isReconnecting },
+  ];
 
   const submitOffer = () => {
     if (!files.length) {
@@ -320,182 +463,322 @@ export default function HostRoom() {
   };
 
   return (
-    <div className="min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
+    <div className="relative min-h-[calc(100vh-4rem)] max-w-7xl mx-auto p-4 sm:p-6 lg:p-8 overflow-hidden">
+      <style>{CSS}</style>
 
-      {/* Top Bar */}
-      <div className="navbar bg-base-100 rounded-2xl shadow-sm border border-base-300/50 px-4 sm:px-6 mb-6">
-        <div className="flex-1 gap-3">
-          <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center">
-            <FolderOpen size={18} className="text-primary" />
+      {/* backdrop */}
+      <div className="peerdrop-dotgrid pointer-events-none absolute inset-0 text-base-content/[0.06]" aria-hidden="true" />
+      <div className="pd-float pointer-events-none absolute -top-20 right-[4%] h-72 w-72 rounded-full bg-primary/[0.07] blur-3xl" aria-hidden="true" />
+      <div className="pd-float pointer-events-none absolute bottom-10 left-[2%] h-72 w-72 rounded-full bg-secondary/[0.06] blur-3xl" style={{ animationDelay: '-4.5s' }} aria-hidden="true" />
+
+      <div className="relative">
+
+        {/* ── Top Bar ── */}
+        <div className="pd-rise relative mb-6 overflow-hidden rounded-2xl border border-base-300/60 bg-base-100/95 shadow-sm backdrop-blur-xl">
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[2px] overflow-hidden">
+            <div className="pd-scan absolute inset-y-0 w-1/4 bg-gradient-to-r from-transparent via-primary/70 to-transparent" />
           </div>
-          <div>
-            <p className="text-sm font-semibold leading-tight">Hosting Session</p>
-            <p className="text-xs text-base-content/40 font-mono">{roomId}</p>
-          </div>
-          {isReconnecting && (
-            <span className="badge badge-warning badge-sm gap-1">
-              <span className="loading loading-spinner loading-xs" /> Reconnecting…
-            </span>
-          )}
-        </div>
 
-        <div className="flex-none hidden sm:flex">
-          <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />
-        </div>
-
-        <div className="flex-none ml-4">
-          <button
-            className="btn btn-ghost btn-sm gap-2 text-error hover:bg-error/10 hover:text-error disabled:opacity-40"
-            onClick={terminateRoom}
-            disabled={isReconnecting || !socket.connected}
-          >
-            <Power size={15} />
-            <span className="hidden sm:inline">End</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Mobile Timer */}
-      <div className="sm:hidden mb-6">
-        <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />
-      </div>
-
-      {/* Bento Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
-
-        {/* Share Link */}
-        <div className="md:col-span-5 lg:col-span-4">
-          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
-            <div className="card-body p-5 gap-4">
-              <div className="flex items-center gap-3">
-                <div className="w-9 h-9 rounded-lg bg-secondary/10 flex items-center justify-center">
-                  <Link size={16} className="text-secondary" />
-                </div>
-                <h2 className="card-title text-sm font-semibold">Share Invite</h2>
-              </div>
-              <ShareLink roomId={roomId} />
+          <div className="flex items-center gap-3 px-4 py-3.5 sm:px-6">
+            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/10">
+              <FolderOpen size={18} className="text-primary" />
+              <span className="absolute -right-0.5 -top-0.5 flex h-3 w-3">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+                <span className="relative inline-flex h-3 w-3 rounded-full border-2 border-base-100 bg-success" />
+              </span>
             </div>
-          </div>
-        </div>
 
-        {/* Stats */}
-        <div className="md:col-span-7 lg:col-span-4 grid grid-cols-2 gap-4 lg:gap-5">
-          <div className="card bg-base-100 shadow-sm border border-base-300/50">
-            <div className="card-body p-5 items-center text-center gap-2">
-              <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center mb-1">
-                <Users size={18} className="text-primary" />
-              </div>
-              <p className="text-3xl font-bold leading-none">{peers.length}</p>
-              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">Connected</p>
-            </div>
-          </div>
-          <div className="card bg-base-100 shadow-sm border border-base-300/50">
-            <div className="card-body p-5 items-center text-center gap-2">
-              <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center mb-1">
-                <HardDrive size={18} className="text-accent" />
-              </div>
-              <p className="text-2xl font-bold leading-none">{files.length ? formatBytes(totalSize) : '—'}</p>
-              <p className="text-[11px] text-base-content/40 uppercase tracking-widest font-medium">Payload</p>
-            </div>
-          </div>
-        </div>
-
-        {/* Transfers */}
-        <div className="md:col-span-12 lg:col-span-4">
-          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
-            <div className="card-body p-5 gap-3">
-              <div className="flex items-center gap-3">
-                <div className="w-9 h-9 rounded-lg bg-success/10 flex items-center justify-center">
-                  <Send size={16} className="text-success" />
-                </div>
-                <h2 className="card-title text-sm font-semibold">Transfers</h2>
-              </div>
-              {Object.entries(transfers).length > 0 ? (
-                <div className="space-y-3">
-                  {Object.entries(transfers).map(([socketId, progress]) => (
-                    <TransferProgress key={socketId} label={`Peer ${socketId.slice(0, 6)}`} progress={progress} />
-                  ))}
-                </div>
-              ) : (
-                <div className="flex flex-col items-center justify-center py-6 text-center">
-                  <div className="w-12 h-12 rounded-2xl bg-base-200/70 flex items-center justify-center mb-3">
-                    <Clock size={20} className="text-base-content/20" />
-                  </div>
-                  <p className="text-xs text-base-content/30 font-medium">No active transfers</p>
-                  <p className="text-[11px] text-base-content/20 mt-0.5">Select files and send to peers</p>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* File Upload */}
-        <div className="md:col-span-8 lg:col-span-8">
-          <div className="card bg-base-100 shadow-sm border border-base-300/50">
-            <div className="card-body p-5 gap-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center">
-                    <Upload size={16} className="text-primary" />
-                  </div>
-                  <h2 className="card-title text-sm font-semibold">Files</h2>
-                </div>
-                {files.length > 0 && (
-                  <span className="badge badge-ghost badge-sm font-mono">
-                    {files.length} file{files.length > 1 ? 's' : ''} · {formatBytes(totalSize)}
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-sm font-semibold leading-tight">Hosting Session</p>
+                {isReconnecting ? (
+                  <span className="badge badge-warning badge-sm gap-1 border-transparent bg-warning/10 text-warning">
+                    <span className="loading loading-spinner loading-xs" /> Reconnecting…
+                  </span>
+                ) : (
+                  <span className="badge badge-sm gap-1.5 border-transparent bg-success/10 text-success">
+                    <span className="h-1.5 w-1.5 rounded-full bg-success" /> Live
                   </span>
                 )}
               </div>
-              <label className="flex flex-col items-center justify-center w-full h-40 border-2 border-dashed rounded-xl border-base-300 bg-base-200/30 hover:bg-primary/5 hover:border-primary/40 cursor-pointer transition-all duration-200 group">
-                <input type="file" multiple className="hidden" onChange={onSelectFiles} />
-                <div className="w-12 h-12 rounded-xl bg-base-300/40 group-hover:bg-primary/10 flex items-center justify-center transition-colors duration-200 mb-3">
-                  <Upload size={22} className="text-base-content/25 group-hover:text-primary transition-colors" />
-                </div>
-                <span className="text-sm font-medium text-base-content/50 group-hover:text-primary transition-colors">Click to browse</span>
-                <span className="text-[11px] text-base-content/25 mt-1">Multiple files arrive as one .zip · up to 10GB</span>
-              </label>
-              {files.length > 0 && (
-                <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-                  {files.map((f) => (
-                    <div key={f.id} className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-base-200/40 text-sm group/item hover:bg-base-200/70 transition-colors">
-                      <FolderOpen size={14} className="text-base-content/20 shrink-0" />
-                      <span className="truncate text-base-content/70 flex-1 min-w-0">{f.name}</span>
-                      <span className="text-base-content/30 text-xs shrink-0 font-mono tabular-nums">{formatBytes(f.size)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <p className="truncate font-mono text-xs text-base-content/40">{roomId}</p>
             </div>
+
+            <div className="hidden shrink-0 sm:block">
+              <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />
+            </div>
+
+            <button
+              className="btn btn-ghost btn-sm gap-2 border border-base-300/60 text-error hover:bg-error/10 hover:text-error disabled:opacity-40"
+              onClick={terminateRoom}
+              disabled={isReconnecting || !socket.connected}
+              title="End session for everyone"
+            >
+              <Power size={15} />
+              <span className="hidden sm:inline">End</span>
+            </button>
           </div>
         </div>
 
-        {/* Send Action */}
-        <div className="md:col-span-4 lg:col-span-4">
-          <div className="card bg-base-100 shadow-sm border border-base-300/50 h-full">
-            <div className="card-body p-5 gap-4 justify-between">
-              <div>
-                <h2 className="text-sm font-semibold mb-1">Ready to send?</h2>
-                <p className="text-xs text-base-content/40 leading-relaxed">
-                  {!socket.connected
-                    ? 'No server connection — waiting…'
-                    : isReconnecting
-                      ? 'Reconnecting to the server…'
-                      : peers.length === 0
-                        ? 'Share the room link and wait for devices to connect.'
-                        : `${peers.length} device${peers.length > 1 ? 's are' : ' is'} waiting. ${files.length === 0 ? 'Add files to begin.' : 'Hit send to start.'}`
-                  }
+        {/* Mobile Timer */}
+        <div className="pd-rise mb-6 sm:hidden" style={{ animationDelay: '80ms' }}>
+          <CountdownTimer expiresAt={expiresAt} onExpire={() => navigate('/')} />
+        </div>
+
+        {/* ── Bento Grid ── */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 lg:gap-5">
+
+          {/* Share Link */}
+          <div className="pd-rise md:col-span-5 lg:col-span-4" style={{ animationDelay: '160ms' }}>
+            <div className={`${CARD} relative`}>
+              <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-secondary/[0.07] via-transparent to-transparent" />
+              <div className="card-body relative h-full gap-4 p-5">
+                <CardHeader icon={Link} tint="bg-secondary/10 text-secondary" title="Share Invite" />
+                <ShareLink roomId={roomId} />
+                <p className="text-[11px] leading-relaxed text-base-content/35">
+                  Anyone with this link can join and receive your files — no account needed.
                 </p>
               </div>
-              <button
-                className="btn btn-primary w-full gap-2"
-                onClick={submitOffer}
-                disabled={!files.length || !peers.length || isReconnecting || !socket.connected}
-              >
-                <Send size={16} />
-                Send to {peers.length || '—'}
-              </button>
             </div>
           </div>
+
+          {/* Devices */}
+          <div className="pd-rise md:col-span-7 lg:col-span-4" style={{ animationDelay: '240ms' }}>
+            <div className={CARD}>
+              <div className="card-body h-full gap-4 p-5">
+                <CardHeader
+                  icon={Users}
+                  tint="bg-primary/10 text-primary"
+                  title="Devices"
+                  right={
+                    <span className={`badge badge-sm border-transparent font-medium ${peers.length ? 'bg-success/10 text-success' : 'bg-base-200 text-base-content/40'}`}>
+                      {peers.length} online
+                    </span>
+                  }
+                />
+                {peers.length > 0 ? (
+                  <ul className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
+                    {peers.map((p) => (
+                      <li
+                        key={p.socketId}
+                        className="flex items-center gap-2.5 rounded-lg border border-base-300/50 bg-base-200/40 px-3 py-2 transition-colors hover:border-primary/30 hover:bg-primary/[0.06]"
+                      >
+                        <span className="relative flex h-2 w-2 shrink-0">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+                          <span className="relative inline-flex h-2 w-2 rounded-full bg-success" />
+                        </span>
+                        <span className="flex-1 text-xs font-medium text-base-content/75">Device</span>
+                        <span className="font-mono text-[10px] text-base-content/30">{p.socketId.slice(0, 8)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="flex flex-1 flex-col items-center justify-center py-4 text-center">
+                    <WaitingRadar />
+                    <p className="mt-3 text-xs font-medium text-base-content/40">Waiting for devices…</p>
+                    <p className="mt-0.5 text-[11px] text-base-content/25">Share the invite link to connect</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Transfers */}
+          <div className="pd-rise md:col-span-12 lg:col-span-4" style={{ animationDelay: '320ms' }}>
+            <div className={CARD}>
+              <div className="card-body h-full gap-3 p-5">
+                <CardHeader
+                  icon={Send}
+                  tint="bg-success/10 text-success"
+                  title="Transfers"
+                  right={activeTransfers > 0 && (
+                    <span className="badge badge-sm border-transparent bg-success/10 font-medium text-success">
+                      {activeTransfers} active
+                    </span>
+                  )}
+                />
+                {activeTransfers > 0 ? (
+                  <div className="space-y-3">
+                    {Object.entries(transfers).map(([socketId, progress]) => (
+                      <TransferProgress key={socketId} label={`Peer ${socketId.slice(0, 6)}`} progress={progress} />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex flex-1 flex-col items-center justify-center py-6 text-center">
+                    <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-base-200/70">
+                      <SignalBars />
+                    </div>
+                    <p className="text-xs font-medium text-base-content/30">No active transfers</p>
+                    <p className="mt-0.5 text-[11px] text-base-content/20">Select files and send to peers</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Files */}
+          <div className="pd-rise md:col-span-8 lg:col-span-8" style={{ animationDelay: '400ms' }}>
+            <div className={CARD}>
+              <div className="card-body gap-4 p-5">
+                <CardHeader
+                  icon={Upload}
+                  tint="bg-primary/10 text-primary"
+                  title="Files"
+                  right={files.length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="badge badge-ghost badge-sm font-mono">
+                        {files.length} file{files.length > 1 ? 's' : ''} · {formatBytes(totalSize)}
+                      </span>
+                      <button
+                        className="btn btn-ghost btn-xs text-base-content/40 hover:bg-error/10 hover:text-error"
+                        onClick={clearFiles}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                />
+
+                <label
+                  className={`group flex h-44 w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed transition-all duration-200 ${
+                    isDragging
+                      ? 'scale-[1.01] border-primary bg-primary/10'
+                      : 'border-base-300 bg-base-200/30 hover:border-primary/40 hover:bg-primary/5'
+                  }`}
+                  onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                  onDragLeave={(e) => {
+                    if (e.currentTarget.contains(e.relatedTarget)) return;
+                    setIsDragging(false);
+                  }}
+                  onDrop={onDropFiles}
+                >
+                  <input type="file" multiple className="hidden" onChange={onSelectFiles} />
+                  <div className={`mb-3 flex h-12 w-12 items-center justify-center rounded-xl transition-all duration-200 ${isDragging ? 'scale-110 bg-primary/15' : 'bg-base-300/40 group-hover:bg-primary/10'}`}>
+                    <Upload
+                      size={22}
+                      className={`transition-colors duration-200 ${isDragging ? 'text-primary' : 'text-base-content/25 group-hover:text-primary'}`}
+                    />
+                  </div>
+                  <span className={`text-sm font-medium transition-colors ${isDragging ? 'text-primary' : 'text-base-content/50 group-hover:text-primary'}`}>
+                    {isDragging ? 'Drop to attach' : 'Click to browse or drag files here'}
+                  </span>
+                  <span className="mt-1 text-[11px] text-base-content/25">Multiple files arrive as one .zip · up to 10GB</span>
+                </label>
+
+                {files.length > 0 && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="flex items-center gap-1.5 text-base-content/40">
+                        <HardDrive size={11} /> Payload
+                      </span>
+                      <span className={`font-mono tabular-nums ${overLimit ? 'text-error' : 'text-base-content/50'}`}>
+                        {formatBytes(totalSize)} / 10 GB
+                      </span>
+                    </div>
+                    <progress
+                      className={`progress h-1.5 w-full ${overLimit ? 'progress-error' : 'progress-primary'}`}
+                      value={Math.min(usagePct, 100)}
+                      max={100}
+                    />
+                    {overLimit && (
+                      <p className="text-[11px] text-error">Exceeds the 10GB limit — remove some files</p>
+                    )}
+                  </div>
+                )}
+
+                {files.length > 0 && (
+                  <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
+                    {files.map((f, i) => (
+                      <div
+                        key={f.id}
+                        className="pd-rise group/item flex items-center gap-3 rounded-lg bg-base-200/40 px-3 py-2.5 text-sm transition-colors hover:bg-base-200/70"
+                        style={{ animationDelay: `${i * 40}ms` }}
+                      >
+                        <FolderOpen size={14} className="shrink-0 text-base-content/20" />
+                        <span className="min-w-0 flex-1 truncate text-base-content/70">{f.name}</span>
+                        <span className="shrink-0 font-mono text-xs tabular-nums text-base-content/30">{formatBytes(f.size)}</span>
+                        <button
+                          onClick={() => removeFile(f.id)}
+                          className="shrink-0 text-base-content/25 opacity-60 transition-all hover:text-error group-hover/item:opacity-100"
+                          aria-label={`Remove ${f.name}`}
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Send Action */}
+          <div className="pd-rise md:col-span-4 lg:col-span-4" style={{ animationDelay: '480ms' }}>
+            <div
+              className={`card h-full overflow-hidden border bg-base-100/95 shadow-sm backdrop-blur-sm transition-all duration-500 ${
+                allReady ? 'border-primary/40 shadow-lg shadow-primary/15' : 'border-base-300/60'
+              }`}
+            >
+              <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-primary/[0.07] to-transparent" />
+
+              <div className="card-body relative h-full justify-between gap-5 p-5">
+                <div className="space-y-4">
+                  <CardHeader icon={Zap} tint="bg-primary/10 text-primary" title="Ready to send?" />
+
+                  <ul className="space-y-2">
+                    {readySteps.map((s) => (
+                      <li key={s.label} className="flex items-center gap-2.5">
+                        <span
+                          className={`flex h-5 w-5 items-center justify-center rounded-full border transition-all duration-300 ${
+                            s.done
+                              ? 'border-success/40 bg-success/15 text-success'
+                              : 'border-base-300 bg-base-200/50 text-base-content/25'
+                          }`}
+                        >
+                          {s.done ? <Check size={11} strokeWidth={3} /> : <span className="h-1 w-1 rounded-full bg-current" />}
+                        </span>
+                        <span className={`text-xs transition-colors ${s.done ? 'font-medium text-base-content/70' : 'text-base-content/35'}`}>
+                          {s.label}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+
+                  <p className="text-xs leading-relaxed text-base-content/40">
+                    {!socket.connected
+                      ? 'No server connection — waiting…'
+                      : isReconnecting
+                        ? 'Reconnecting to the server…'
+                        : peers.length === 0
+                          ? 'Share the room link and wait for devices to connect.'
+                          : `${peers.length} device${peers.length > 1 ? 's are' : ' is'} waiting. ${files.length === 0 ? 'Add files to begin.' : 'Hit send to start.'}`
+                    }
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  {files.length > 0 && (
+                    <div className="flex items-center justify-between rounded-lg bg-base-200/50 px-3 py-2 text-[11px]">
+                      <span className="text-base-content/40">Payload</span>
+                      <span className="font-mono tabular-nums text-base-content/60">
+                        {files.length} file{files.length > 1 ? 's' : ''} · {formatBytes(totalSize)}
+                      </span>
+                    </div>
+                  )}
+
+                  <button
+                    className="pd-shine btn btn-primary group/btn w-full gap-2 shadow-lg shadow-primary/25 transition-all duration-200 enabled:hover:-translate-y-0.5 enabled:hover:shadow-xl enabled:hover:shadow-primary/40 active:translate-y-0"
+                    onClick={submitOffer}
+                    disabled={!files.length || !peers.length || isReconnecting || !socket.connected}
+                  >
+                    <Send size={16} className="transition-transform duration-200 group-hover/btn:-translate-y-0.5 group-hover/btn:translate-x-0.5" />
+                    Send to {peers.length || '—'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
     </div>
