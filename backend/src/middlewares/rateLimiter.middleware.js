@@ -9,12 +9,3 @@ export const apiLimiter = rateLimit({
   legacyHeaders: false,
   message: { ok: false, error: 'too many requests, slow down' },
 });
-
-// Strict limiter for heavy torrent lookups and streams
-export const torrentLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, // 5 minutes
-  max: 5, // 5 torrent requests per 5 minutes per IP
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { ok: false, error: 'too many torrent requests, please wait before trying again' },
-});
