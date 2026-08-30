@@ -11,12 +11,19 @@ function getTorrent(source, timeoutMs = 45000) {
     const existing = client.get(source);
 
     let existingTorrent = null;
+    
+    // Check if client.get returned a valid WebTorrent Torrent object with an .once method
     if (existing && typeof existing === 'object' && typeof existing.once === 'function' && !existing.destroyed) {
       existingTorrent = existing;
     } else if (typeof existing === 'string') {
-      existingTorrent = client.torrents.find(t => t.infoHash === existing && !t.destroyed) || null;
+      // If it returned an infoHash string, safely locate the torrent object in client.torrents
+      const found = client.torrents.find(t => t && t.infoHash === existing && !t.destroyed);
+      if (found && typeof found.once === 'function') {
+        existingTorrent = found;
+      }
     }
 
+    // Handle existing torrent instance safely
     if (existingTorrent) {
       if (existingTorrent.ready) return resolve(existingTorrent);
       const timer = setTimeout(() => reject(new Error('Timeout waiting for torrent to ready')), timeoutMs);
@@ -50,8 +57,8 @@ function getTorrent(source, timeoutMs = 45000) {
     torrent.once('error', (err) => {
       clearTimeout(timer);
       if (err.message?.includes('Cannot add duplicate') || err.message?.includes('already in client')) {
-        const dup = client.torrents.find(t => t.infoHash === torrent.infoHash && !t.destroyed);
-        if (dup) {
+        const dup = client.torrents.find(t => t && t.infoHash === torrent.infoHash && !t.destroyed);
+        if (dup && typeof dup.once === 'function') {
           if (dup.ready) return resolve(dup);
           const t2 = setTimeout(() => reject(new Error('Timeout waiting for duplicate torrent')), timeoutMs);
           dup.once('ready', () => { clearTimeout(t2); resolve(dup); });
