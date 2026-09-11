@@ -1,13 +1,9 @@
-// FileOfferModal.jsx
 import { useState } from 'react';
 import {
   X, Download, FolderArchive, Files, FileText, ShieldCheck,
 } from 'lucide-react';
 import { formatBytes } from '../utils/formatBytes';
 
-/* ── Motion & effects — same visual language as the other screens.
-     Uniquely prefixed (fom-) so it can never collide with page-level styles,
-     self-contained (unmounts with the modal), and reduced-motion safe. ── */
 const CSS = `
   @keyframes fom-fade {
     from { opacity: 0; }
