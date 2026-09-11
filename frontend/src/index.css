@@ -54,7 +54,7 @@
   }
 }
 
-/* Enable all 4 themes — your custom ones + the two built-in defaults */
+/* Enable all 4 themes */
 @plugin "daisyui" {
   themes:
     darkblue --default --prefersdark,
@@ -64,7 +64,7 @@
 }
 
 /* ---------------------------------------------- */
-/* CUSTOM DARK THEME — deep navy + electric blue   */
+/* CUSTOM DARK THEME - deep navy and electric blue   */
 /* ---------------------------------------------- */
 @plugin "daisyui/theme" {
   name: "darkblue";
@@ -110,7 +110,7 @@
 }
 
 /* ---------------------------------------------- */
-/* CUSTOM LIGHT THEME — clean white + fresh green  */
+/* CUSTOM LIGHT THEME - clean white and fresh green  */
 /* ---------------------------------------------- */
 @plugin "daisyui/theme" {
   name: "lightgreen";
