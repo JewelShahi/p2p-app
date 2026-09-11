@@ -1,4 +1,3 @@
-// roomManager.js
 import { v4 as uuidv4 } from 'uuid';
 
 const MIN_DURATION = 10;
@@ -6,8 +5,7 @@ const MAX_DURATION = 60;
 const STEP = 5;
 const DEFAULT_DURATION = 20;
 
-// FIX (mobile): 2 min is plenty for a phone opening the gallery, and short
-// enough to clean up genuinely-gone peers. 5 min left ghosts around too long.
+// 2 min left ghosts around
 const DISCONNECT_GRACE_MS = 2 * 60 * 1000;
 
 const isValidDuration = (minutes) => {
@@ -84,9 +82,7 @@ class RoomManager {
     return removed;
   }
 
-  // FIX (ghost users): remove every stale entry for this user EXCEPT the
-  // socket that is (re)joining right now. Prevents the reconnect race where
-  // the old socket's later disconnect wipes the fresh member.
+  // Socket that is (re)joining right now. Prevents the reconnect race where the old socket's later disconnect wipes the fresh member
   removeStaleUserSockets(roomId, userId, keepSocketId) {
     const room = this.getRoom(roomId);
     if (!room) return;
@@ -97,7 +93,7 @@ class RoomManager {
     }
   }
 
-  // True if this user has at least one socket that is currently connected.
+  // True if this user has at least one socket that is currently connected
   hasLiveSocketForUser(roomId, userId) {
     const room = this.getRoom(roomId);
     if (!room) return false;
@@ -119,7 +115,7 @@ class RoomManager {
   getLiveMembers(roomId) {
     const room = this.getRoom(roomId);
     if (!room) return [];
-    // Dedupe by userId so the host never sees the same person twice.
+    // Dedupe by userId so the host never sees the same person twice
     const byUser = new Map();
     for (const m of room.members.values()) {
       if (this.io.sockets.sockets.has(m.socketId)) {
@@ -156,9 +152,7 @@ class RoomManager {
     const timer = setTimeout(() => {
       room.pendingLeaves.delete(userId);
 
-      // ── THE RACE FIX ──
-      // If the user already reconnected on a newer socket, do NOT remove them
-      // and do NOT tell the host they left.
+      // If the user already reconnected on a newer socket, do not remove them and do not tell the host they left
       if (this.hasLiveSocketForUser(roomId, userId)) return;
 
       this.removeMemberByUserId(roomId, userId);
