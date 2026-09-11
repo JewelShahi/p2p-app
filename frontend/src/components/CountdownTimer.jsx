@@ -1,4 +1,3 @@
-// CountdownTimer.jsx
 import { useEffect, useState } from 'react';
 import { Clock } from 'lucide-react';
 
@@ -22,9 +21,7 @@ export default function CountdownTimer({ expiresAt, onExpire }) {
 
   const urgent = remaining <= 60;
   const low = remaining <= 300;
-
-  // ≤60s keeps the original error styling (plus a pulse); ≤5 min is a new,
-  // purely visual amber "heads-up" tier — delete the `low` branch if unwanted.
+  
   const tier = urgent
     ? 'border-error/30 bg-error/10 text-error'
     : low
