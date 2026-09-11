@@ -11,7 +11,6 @@ import FileOfferModal from '../components/FileOfferModal';
 import TransferProgress from '../components/TransferProgress';
 import { createPeerConnection, receiveFiles, cleanupReceiveListener } from '../utils/peerTransfer';
 
-/* ── Motion & effects — same design system as Home/HostRoom, reduced-motion safe ── */
 const CSS = `
   @keyframes pd-rise {
     from { opacity: 0; transform: translateY(14px); }
@@ -47,7 +46,6 @@ const CSS = `
 
 const CARD = 'card h-full overflow-hidden border border-base-300/60 bg-base-100/95 shadow-sm backdrop-blur-sm';
 
-/* Radar rings while the receiver waits for the host — mirrors HostRoom's "waiting for devices". */
 function WaitingRadar({ icon: Icon = Radio }) {
   return (
     <span className="relative flex h-16 w-16 items-center justify-center" aria-hidden="true">
@@ -60,7 +58,7 @@ function WaitingRadar({ icon: Icon = Radio }) {
   );
 }
 
-/* Shared card header: icon tile + title + divider + optional right slot. */
+/* Shared card header - icon tile, title, divider optional, right slot */
 function CardHeader({ icon: Icon, tint, title, right }) {
   return (
     <div className="flex items-center gap-3">
@@ -91,7 +89,7 @@ export default function JoinRoom() {
   const hasReceivedData = useRef(false);
   const isReceivingRef = useRef(false);
   const lastOfferIdRef = useRef(null);
-  const transferDoneRef = useRef(false); // true ONLY when integrity-checked done
+  const transferDoneRef = useRef(false);
 
   const downloadStateRef = useRef('idle');
   useEffect(() => { downloadStateRef.current = downloadState; }, [downloadState]);
@@ -139,7 +137,7 @@ export default function JoinRoom() {
       transferDoneRef.current = false;
 
       const stallTimer = setTimeout(() => {
-        // FIX (corruption): a stall is NOT a success. Never mark complete here.
+        // A stall is NOT a success, never mark complete here
         toast.error('Download stalled — please ask the host to re-send', { id: 'download-stalled' });
         clearDownloadState();
       }, 30000);
@@ -171,7 +169,7 @@ export default function JoinRoom() {
           }
           cleanupReceiveListener();
           isReceivingRef.current = false;
-          // FIX (corruption): integrity errors must NOT fall back to "received".
+          // integrity errors must not fall back to received
           const msg = err === 'incomplete-file' || err === 'incomplete-transfer'
             ? 'The file arrived incomplete — please ask the host to re-send'
             : 'Something interrupted the download — please try again';
@@ -182,7 +180,7 @@ export default function JoinRoom() {
       });
     };
 
-    // ──── REJOIN (reuses the SAME identity — no ghosts) ────
+    // ──── REJOIN (no ghosts) ────
     const tryRejoin = () => {
       if (!myUserId.current) return;
       const isFirstJoin = !hasJoinedOnce.current;
@@ -209,7 +207,7 @@ export default function JoinRoom() {
 
     socket.on('connect', tryRejoin);
 
-    // ──── FIX (ghost users): only ONE of rejoin OR fresh-join, never both. ────
+    // ──── only one of rejoin OR fresh-join, never both ────
     if (myUserId.current) {
       if (socket.connected) tryRejoin();
       else socket.connect();
@@ -233,7 +231,7 @@ export default function JoinRoom() {
       });
     }
 
-    // ──── MOBILE: reconnect instantly when the tab returns from the gallery ────
+    // ──── MOBILE - reconnect instantly when the tab returns from the gallery ────
     const unwireVisibility = wireVisibilityReconnect();
 
     // ──── WebRTC signaling ────
@@ -281,8 +279,8 @@ export default function JoinRoom() {
         });
         hostPeer.current.on('close', () => {
           cleanupReceiveListener();
-          // FIX (corruption): only the integrity-checked onDone marks complete.
-          // A close during download WITHOUT a real 'done' is an interruption.
+          // Only the integrity-checked onDone marks complete
+          // A close during download without a real 'done' is an interruption
           if (downloadStateRef.current === 'downloading' && !transferDoneRef.current) {
             isReceivingRef.current = false;
             setDownloadState('idle');
@@ -295,7 +293,7 @@ export default function JoinRoom() {
       hostPeer.current.signal(signal);
     });
 
-    // ──── FIX (mobile corruption): keep a LIVE channel; only rebuild a dead one ────
+    // ──── keep a LIVE channel, only rebuild a dead one ────
     socket.on('peer-reconnected', ({ isHost, socketId }) => {
       if (!isHost) return;
       hostSocketIdRef.current = socketId;
@@ -342,14 +340,14 @@ export default function JoinRoom() {
         return;
       }
 
-      // ──── FIX (always-zip): more than one file → force a single .zip ────
+      // ──── more than one file → force a single zip ────
       const effectiveMode = currentOffer.forceZip || (currentOffer.files?.length > 1)
         ? 'zip'
         : (mode || 'individual');
 
       let fileHandles = null;
 
-      // Only the single-file path uses the native save picker.
+      // Only the single-file path uses the native save picker
       if (accept && effectiveMode === 'individual' && 'showSaveFilePicker' in window) {
         fileHandles = new Map();
         try {
@@ -420,14 +418,14 @@ export default function JoinRoom() {
       toast.error('No connection — please wait', { id: 'leave-blocked' });
       return;
     }
-    // Clear identity so we don't auto-rejoin a room we intentionally left.
+    // Clear identity so we don't auto-rejoin a room we intentionally left
     sessionStorage.removeItem(`peerUserId:${roomId}`);
     socket.emit('leave-room');
     toast('You left the session', { icon: '👋', id: 'left-session' });
     navigate('/');
   };
 
-  // Additive, logic-free convenience.
+  // Additive, logic-free convenience
   const copyRoomId = async () => {
     try {
       await navigator.clipboard.writeText(roomId);
