@@ -1,4 +1,3 @@
-// ShareLink.jsx
 import { useState } from 'react';
 import { Copy, Check, Link2 } from 'lucide-react';
 import toast from 'react-hot-toast';
