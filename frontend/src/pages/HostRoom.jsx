@@ -1,4 +1,3 @@
-// HostRoom.jsx
 import { useEffect, useRef, useState } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
@@ -13,9 +12,8 @@ import TransferProgress from '../components/TransferProgress';
 import { createPeerConnection, sendFiles, cancelTransfer } from '../utils/peerTransfer';
 import { formatBytes } from '../utils/formatBytes';
 
-const SIZE_LIMIT = 10 * 1024 * 1024 * 1024; // display only — the real check lives in submitOffer
+const SIZE_LIMIT = 10 * 1024 * 1024 * 1024;
 
-/* ── Motion & effects — self-contained, reduced-motion safe ── */
 const CSS = `
   @keyframes pd-rise {
     from { opacity: 0; transform: translateY(14px); }
@@ -68,7 +66,6 @@ const CSS = `
 
 const CARD = 'card h-full overflow-hidden border border-base-300/60 bg-base-100/95 shadow-sm backdrop-blur-sm';
 
-/* Four pulsing bars — matches the "live signal" language of the landing page. */
 function SignalBars() {
   return (
     <span className="inline-flex items-end gap-[3px] h-4 shrink-0" aria-hidden="true">
@@ -83,7 +80,7 @@ function SignalBars() {
   );
 }
 
-/* Expanding radar rings while we wait for a device to join. */
+/* Expanding radar rings while we wait for a device to join */
 function WaitingRadar() {
   return (
     <span className="relative flex h-14 w-14 items-center justify-center" aria-hidden="true">
@@ -96,7 +93,7 @@ function WaitingRadar() {
   );
 }
 
-/* Shared card header: icon tile + title + divider + optional right slot. */
+/* Shared card header: icon tile + title + divider + optional right slot */
 function CardHeader({ icon: Icon, tint, title, right }) {
   return (
     <div className="flex items-center gap-3">
@@ -115,12 +112,7 @@ export default function HostRoom() {
   const { state } = useLocation();
   const navigate = useNavigate();
 
-  // FIX (timer drift): this must be stateful. It used to be `useState` with no
-  // setter, so it only ever reflected `location.state` from the very first
-  // mount. Leaving and coming back (refresh, closed tab, remount) wiped
-  // `location.state`, so it fell back to a brand new made-up 20-minute window
-  // that had nothing to do with the room's real expiry — hence the drift
-  // against the receiver, who always gets the real value from the server.
+  // Made the timer stateful so it preserves the real expiry across remounts/refreshes instead of resetting to a fake 20-minute window and drifting from the server value
   const [expiresAt, setExpiresAt] = useState(state?.expiresAt || Date.now() + 20 * 60 * 1000);
   const [peers, setPeers] = useState([]);
   const [files, setFiles] = useState([]);
@@ -146,7 +138,7 @@ export default function HostRoom() {
   useEffect(() => { peersRef.current = peers; }, [peers]);
   const hasJoinedOnce = useRef(false);
 
-  // FIX (ghost users): dedupe the peer list by userId, keeping the newest socket.
+  // ghost user fix - dedupe the peer list by userId, keeping the newest socket
   const upsertPeer = (list, { socketId, userId }) => {
     const withoutDupes = list.filter((p) => p.userId !== userId && p.socketId !== socketId);
     return [...withoutDupes, { socketId, userId }];
@@ -228,7 +220,7 @@ export default function HostRoom() {
       });
     };
 
-    // ──── REJOIN (host reuses its identity — no ghosts) ────
+    // ──── REJOIN no ghosts ────
     const tryRejoin = () => {
       if (!hostUserId.current) return;
       const isFirstJoin = !hasJoinedOnce.current;
@@ -245,12 +237,11 @@ export default function HostRoom() {
         }
         if (!isFirstJoin) toast.success('Back online', { id: 'rejoin-success' });
 
-        // FIX (timer drift): always resync to the server's authoritative
-        // expiry on every (re)join, exactly like JoinRoom already does.
+        // always resync to the server's authoritative expiry on every (re)join, exactly like JoinRoom already does
         if (res.expiresAt) setExpiresAt(res.expiresAt);
 
         if (Array.isArray(res.members)) {
-          // Dedupe the authoritative list by userId (server already does, but be safe).
+          // Dedupe the authoritative list by userId (server already does, but be safe)
           const byUser = new Map();
           for (const m of res.members) byUser.set(m.userId, m);
           const members = Array.from(byUser.values());
@@ -284,7 +275,7 @@ export default function HostRoom() {
     if (socket.connected) tryRejoin();
     else socket.connect();
 
-    // ──── MOBILE: reconnect instantly when the host tab returns (gallery) ────
+    // ──── MOBILE - reconnect instantly when the host tab returns ────
     const unwireVisibility = wireVisibilityReconnect();
 
     socket.on('peer-reconnected', ({ userId, socketId }) => {
@@ -309,7 +300,6 @@ export default function HostRoom() {
     });
 
     socket.on('peer-joined', ({ peerSocketId, peerUserId }) => {
-      // FIX (ghost users): dedupe by userId so repeated joins can't stack rows.
       setPeers((p) => upsertPeer(p, { socketId: peerSocketId, userId: peerUserId }));
       if (!isPeerReady(peerConnections.current[peerSocketId])) {
         toast.success('A new device connected', { id: 'peer-joined' });
@@ -380,7 +370,7 @@ export default function HostRoom() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Shared by the file input AND drag & drop — same mapping/reset logic as before.
+  // Shared by the file input and drag and drop
   const addFiles = (fileList) => {
     const list = Array.from(fileList).map((file) => ({
       id: crypto.randomUUID(),
@@ -399,8 +389,7 @@ export default function HostRoom() {
 
   const onSelectFiles = (e) => {
     addFiles(e.target.files);
-    // FIX (mobile): reset so the host can re-pick the SAME file after the
-    // gallery round-trip (browsers block re-selecting an identical file).
+    // Reset so the host can re-pick the SAME file after the gallery round-trip
     e.target.value = '';
   };
 
