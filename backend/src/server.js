@@ -16,10 +16,10 @@ dotenv.config();
 const PORT = Number.parseInt(process.env.PORT || '4000', 10);
 const app = express();
 
-// Trust ONE reverse proxy (Render/Cloudflare/Nginx). Adjust if you chain proxies.
+// Trust one reverse proxy, adjust if you chain proxies
 app.set('trust proxy', 1);
 
-// ── CORS: parse to real origins; only wildcard preview hosts in non-prod ──
+// CORS - parse to real origins, only wildcard preview hosts in non-prod
 const normalize = (v) => { try { return new URL(v).origin; } catch { return null; } };
 const allowList = (process.env.CLIENT_ORIGIN || '')
   .split(',').map((v) => normalize(v.trim())).filter(Boolean);
@@ -49,22 +49,18 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: corsOrigin, methods: ['GET', 'POST'], credentials: true },
   transports: ['websocket', 'polling'],
-  // ── P2P MOBILE FIX ──
-  // Give a backgrounded phone (opening the gallery/file picker) time to come
-  // back before the server declares it disconnected. This is what lets the
-  // frontend reconnect logic actually recover instead of losing the peer.
+  // Give a backgrounded phone time to come back before the server declares it disconnected
   pingInterval: 25_000,
   pingTimeout: 60_000,
   maxHttpBufferSize: 1e6,
 });
 
-// RoomManager needs `io` to broadcast (room-closed, etc.)
 const roomManager = new RoomManager(io);
 app.locals.roomManager = roomManager;
 
 registerSignaling(io, roomManager);
 
-// Safety-net sweep in case a room's expiry timer was ever lost.
+// Safety-net sweep in case a room's expiry timer was ever lost
 const sweep = setInterval(() => roomManager.sweep(), 30_000);
 sweep.unref?.();
 
@@ -74,7 +70,7 @@ app.get('/', (req, res) => {
   res.status(200).json({ ok: true, message: 'Server is running' });
 });
 
-// Must be registered after all routes.
+// Must be registered after all routes
 app.use(errorHandler);
 
 server.listen(PORT, '0.0.0.0', () => {
