@@ -1,4 +1,3 @@
-// Navbar.jsx
 import { useEffect } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import { Link } from 'react-router-dom';
@@ -6,7 +5,6 @@ import { Sun, Moon } from 'lucide-react';
 import { toggleTheme } from '../features/theme/themeSlice';
 import peerdropIcon from '../assets/peerdrop-icon.png';
 
-/* ── Navbar-only styles, nb- prefixed, reduced-motion safe ── */
 const CSS = `
   /* icon spins in fresh each time the theme flips */
   @keyframes nb-pop {
@@ -22,7 +20,7 @@ const Navbar = () => {
   const dispatch = useDispatch();
   const theme = useSelector((state) => state.theme.theme);
 
-  // Syncs the Redux state to the DOM attribute so DaisyUI updates the theme
+  // Syncs the Redux state to the dom attribute so daisyui updates the theme
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
@@ -34,7 +32,7 @@ const Navbar = () => {
       {/* hairline accent along the bottom edge — echoes the scan-light on the pages below */}
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-gradient-to-r from-transparent via-primary/25 to-transparent" aria-hidden="true" />
 
-      {/* Left: logo + name, links home */}
+      {/* logo name and links */}
       <div className="flex-1">
         <Link
           to="/"
@@ -52,7 +50,7 @@ const Navbar = () => {
         </Link>
       </div>
 
-      {/* Right: theme toggle */}
+      {/* theme toggle */}
       <div className="flex-none">
         <button
           className="btn btn-ghost btn-circle border border-transparent text-base-content/70 transition-all duration-200 hover:border-base-300/60 hover:bg-base-100 active:scale-90"
