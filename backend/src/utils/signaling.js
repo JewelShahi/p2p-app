@@ -1,4 +1,3 @@
-// signaling.js
 import { v4 as uuidv4 } from 'uuid';
 import { isValidDuration, DEFAULT_DURATION } from './roomManager.js';
 
@@ -87,8 +86,7 @@ export function registerSignaling(io, roomManager) {
         room.hostSocketId = socket.id;
         roomManager.cancelHostDisconnect(roomId);
       } else {
-        // FIX (ghost users): cancel any pending leave FIRST, then drop only the
-        // OLD sockets for this user, keeping the fresh one we're adding now.
+        // cancel any pending leave FIRST, then drop only the old sockets for this user, keeping the fresh one we're adding now
         roomManager.cancelPeerDisconnect(roomId, userId);
         roomManager.removeStaleUserSockets(roomId, userId, socket.id);
         room.members.set(socket.id, {
@@ -99,8 +97,7 @@ export function registerSignaling(io, roomManager) {
         });
       }
 
-      // Emit peer-reconnected BEFORE the ack so peers tear down the old host
-      // connection before the host starts sending new signals.
+      // Emit peer-reconnected before the ack so peers tear down the old host connection before the host starts sending new signals
       socket.to(roomId).emit('peer-reconnected', {
         userId,
         isHost: wasHost,
@@ -151,7 +148,7 @@ export function registerSignaling(io, roomManager) {
         offerId: uuidv4(),
         files,
         totalSize,
-        // FIX (always-zip): tell receivers to zip when more than one file.
+        // tell receivers to zip when more than one file
         forceZip: files.length > 1,
         createdAt: Date.now(),
       };
@@ -214,7 +211,7 @@ export function registerSignaling(io, roomManager) {
       const room = roomManager.getRoom(roomId);
       if (!room) return;
       if (socket.data.isHost) {
-        // Only schedule host teardown if THIS socket is still the active host.
+        // Only schedule host teardown if this socket is still the active host
         if (room.hostSocketId === socket.id) {
           roomManager.scheduleHostDisconnect(roomId);
           socket.to(roomId).emit('peer-disconnected-temporarily', { isHost: true });
