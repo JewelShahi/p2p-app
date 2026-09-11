@@ -21,7 +21,6 @@ const HUD = [
   { icon: Timer, label: 'Room TTL', value: '10–60 min' },
 ];
 
-/* ── Motion & effects — all self-contained and reduced-motion safe ── */
 const CSS = `
   @keyframes pd-rise {
     from { opacity: 0; transform: translateY(14px); }
@@ -77,8 +76,6 @@ const CSS = `
   }
 `;
 
-// Four bars of rising height, gently pulsing — a small stand-in for
-// "live signal" that ties back to the transport/radio language in the HUD.
 function SignalBars() {
   return (
     <span className="inline-flex items-end gap-[3px] h-4 shrink-0" aria-hidden="true">
@@ -177,7 +174,7 @@ export default function Home() {
             </span>
           </div>
 
-          {/* ── Action console: stacked on mobile, two panes from md up ── */}
+          {/* ── Action console - stacked on mobile, two panes from md up ── */}
           <div className="pd-rise group relative mt-12 sm:mt-14 max-w-2xl mx-auto" style={{ animationDelay: '400ms' }}>
             {/* ambient glow behind the card */}
             <div className="pointer-events-none absolute -inset-8 rounded-full bg-gradient-to-r from-primary/15 via-secondary/10 to-primary/15 opacity-60 blur-3xl transition-opacity duration-700 group-hover:opacity-100" aria-hidden="true" />
@@ -190,7 +187,7 @@ export default function Home() {
 
               <div className="flex flex-col md:flex-row">
 
-                {/* Left pane: how it works */}
+                {/* Left pane - how it works */}
                 <div className="flex-1 p-6 sm:p-7 border-b md:border-b-0 md:border-r border-base-300/60">
                   <div className="mb-6 flex items-center gap-3">
                     <p className="text-[11px] font-mono uppercase tracking-widest text-base-content/35 whitespace-nowrap">
@@ -219,7 +216,7 @@ export default function Home() {
                   </ol>
                 </div>
 
-                {/* Right pane: the form */}
+                {/* Right pane - the form */}
                 <div className="flex-1 p-6 sm:p-7 bg-base-200/30 flex flex-col justify-center gap-5">
                   <div className="flex items-center gap-2.5">
                     <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
