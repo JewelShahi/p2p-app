@@ -1,13 +1,10 @@
-// peerTransfer.js
 import SimplePeer from 'simple-peer';
 import toast from 'react-hot-toast';
 import { createElement } from 'react';
 
 const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-// FIX (corruption): 16KB is the safe max message size across ALL browsers,
-// including mobile Safari/Chrome. 64KB can be silently dropped/split on some
-// mobile WebRTC stacks — a prime cause of "corrupted" files.
+// Reduced the max message size to 16KB to avoid silent drops/splits on mobile WebRTC and prevent file corruption
 const CHUNK_SIZE = 16 * 1024;
 const BACKPRESSURE_LIMIT = 1 * 1024 * 1024; // pause sending above 1MB buffered
 
@@ -63,8 +60,7 @@ export function createPeerConnection({ initiator, socket, targetSocketId, onFail
       return;
     }
     if (state === 'disconnected') {
-      // FIX (mobile): give a backgrounded phone longer to come back before
-      // we declare the peer dead. 5s was too short for a gallery round-trip.
+      // give a backgrounded phone longer to come back before we declare the peer dead. 5s was too short for a gallery round-trip
       if (disconnectTimer) clearTimeout(disconnectTimer);
       disconnectTimer = setTimeout(() => {
         const current = peer._pc?.iceConnectionState;
@@ -127,7 +123,7 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
       for (const f of files) {
         if (cancelled) break;
 
-        // Announce file with its exact size so the receiver can verify it.
+        // Announce file with its exact size so the receiver can verify it
         peer.send(JSON.stringify({ type: 'file-start', id: f.id, name: f.name, size: f.size }));
 
         const reader = f.file.stream().getReader();
@@ -146,14 +142,14 @@ export function sendFiles({ peer, files, onProgress, onDone, onCancel, onError }
           }
         }
 
-        // file-end carries the byte size so the receiver can do a per-file check.
+        // file-end carries the byte size so the receiver can do a per-file check
         if (!cancelled) peer.send(JSON.stringify({ type: 'file-end', id: f.id, size: f.size }));
       }
 
       if (!cancelled) {
-        // transfer-complete carries the grand total for a final integrity check.
+        // transfer-complete carries the grand total for a final integrity check
         peer.send(JSON.stringify({ type: 'transfer-complete', totalSize }));
-        // Flush the channel fully before we resolve, so nothing is lost.
+        // Flush the channel fully before we resolve, so nothing is lost
         while (peer._channel && peer._channel.bufferedAmount > 0) {
           await new Promise((r) => setTimeout(r, 40));
         }
@@ -180,7 +176,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   let writer = null;
   let currentMeta = null;
   let received = 0;         // total bytes across all files
-  let fileReceived = 0;     // bytes for the current file (integrity)
+  let fileReceived = 0;     // bytes for the current file
   let totalExpected = 0;    // sum of announced file sizes
   let completed = false;
   const zipParts = [];
@@ -224,7 +220,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
             console.error('[receiveFiles] size mismatch', currentMeta?.name, fileReceived, 'vs', expected);
             try { if (writer?.abort) await writer.abort(); } catch {}
             writer = null;
-            // Refuse to deliver a truncated/corrupt file.
+            // Refuse to deliver a truncated/corrupt file
             onError?.('incomplete-file');
             return;
           }
@@ -253,8 +249,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
             const JSZip = (await import('jszip')).default;
             const zip = new JSZip();
             zipParts.forEach((p) => zip.file(p.name, p.blob));
-            // STORE (level 0): files are already compressed formats most of the
-            // time; this is far faster and avoids OOM on mobile for big batches.
+            // files are already compressed formats most of the time, this is far faster and avoids oom on mobile for big batches
             const blob = await zip.generateAsync({
               type: 'blob',
               compression: 'STORE',
@@ -293,8 +288,7 @@ export function receiveFiles({ peer, mode, fileHandles, onProgress, onDone, onEr
   };
   attachChannelListener();
 
-  // Expose whether the transfer truly completed, so callers don't mark a
-  // truncated download as "done" on an unexpected channel close.
+  // Expose whether the transfer truly completed, so callers don't mark a truncated download as done on an unexpected channel close
   return { isComplete: () => completed };
 }
 
