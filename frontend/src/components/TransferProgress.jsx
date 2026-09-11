@@ -1,4 +1,3 @@
-// TransferProgress.jsx
 import { Check } from 'lucide-react';
 
 const CSS = `
