@@ -2,8 +2,8 @@
 import { io } from 'socket.io-client';
 import { SOCKET_URL } from '../constants/config';
 
-// FIX (mobile drop): explicit, aggressive reconnection so a phone that
-// backgrounds (opening the gallery/file picker) comes back instead of dying.
+// aggressive reconnection so a phone that
+// backgrounds comes back instead of dying
 const socket = io(SOCKET_URL, {
   autoConnect: false,
   transports: ['websocket'],
@@ -14,8 +14,7 @@ const socket = io(SOCKET_URL, {
   timeout: 20000,
 });
 
-// Reconnect the instant a backgrounded tab returns to the foreground.
-// Call this once from each room page; it returns an unsubscribe fn.
+// Reconnect the instant a backgrounded tab returns to the foreground
 export function wireVisibilityReconnect() {
   const kick = () => {
     if (document.visibilityState === 'visible' && socket.disconnected) {
