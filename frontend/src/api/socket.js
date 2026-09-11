@@ -1,4 +1,3 @@
-// api/socket.js
 import { io } from 'socket.io-client';
 import { SOCKET_URL } from '../constants/config';
 
