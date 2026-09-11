@@ -1,11 +1,9 @@
-// Centralized error handler — must be registered after all routes in server.js.
-// Catches anything passed to next(err) or thrown synchronously in a route/controller.
+// Centralized error handler
 const errorHandler = (err, req, res, next) => {
   console.error(err);
 
   if (res.headersSent) {
-    // Response already started streaming (e.g. mid-download) — can't send a
-    // fresh JSON body, just hand off to Express's default handler.
+    // Response already started streaming - can't send a fresh JSON body, just hand off to express's default handler.
     return next(err);
   }
 
